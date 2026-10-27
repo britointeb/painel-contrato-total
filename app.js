@@ -43,6 +43,100 @@ const UnifiedData = (() => {
   const percentNumber = value => typeof value === 'string' && value.includes('%') ? number(value) / 100 : number(value);
   const split = value => [...new Set(normalize(value).split(/\s*;\s*/).filter(v => v && v !== '-' && v !== 'N/I'))];
   const documentId = row => [key(row.ug), key(row.documento)].join('|');
+  const ndParts = detail => {
+    const codes = String(detail.nd_codigo || '').split(/\s*;\s*/);
+    const names = String(detail.nd_nome || '').split(/\s*;\s*/).map(normalize);
+    const records = new Map();
+    codes.forEach((rawCode, index) => {
+      const code = String(rawCode).replace(/\D/g, '');
+      if (code.length < 6 || code.length > 8) return;
+      const name = names[index] || (names.length === 1 ? names[0] : '') || 'N/I';
+      const subelemento = code.length === 8 ? code.slice(6, 8) : '';
+      const part = {
+        code,
+        name,
+        grupo: code.slice(1, 2),
+        modalidade: code.slice(2, 4),
+        elemento: code.slice(4, 6),
+        subelemento,
+        subelemento_filter: subelemento ? `${subelemento} – ${name}` : ''
+      };
+      if (!records.has(code) || records.get(code).name === 'N/I') records.set(code, part);
+    });
+    return [...records.values()];
+  };
+  const ndDimensionValues = detail => {
+    const parts = ndParts(detail);
+    const values = field => [...new Set(parts.map(part => part[field]).filter(Boolean))];
+    return {
+      nd_grupo_values: values('grupo'),
+      nd_modalidade_values: values('modalidade'),
+      nd_elemento_values: values('elemento'),
+      nd_subelemento_filter_values: values('subelemento_filter')
+    };
+  };
+  const ndBudgetFields = {
+    fGrupo: 'grupo',
+    fNdModalidade: 'modalidade',
+    fElemento: 'elemento',
+    fSubelemento: 'subelemento_filter'
+  };
+  const budgetDetailPortions = (detail, filters) => {
+    const parts = ndParts(detail);
+    if (parts.length < 2) return matchesBudgetDetail(detail, filters) ? [detail] : [];
+    const metricKeys = ['v_empenhado', 'v_recebido', 'v_liquidado', 'v_pago', 'v_cancelado', 'v_bloqueado', 'v_a_liquidar', 'v_a_pagar', 'v_executado'];
+    return parts.map(part => {
+      const portion = {
+        ...detail,
+        nd_codigo: part.code,
+        nd_nome: part.name,
+        nd_filter_values: [part.name && part.name !== 'N/I' ? `${part.name} – ${part.code}` : part.code]
+      };
+      metricKeys.forEach(field => {
+        portion[field] = (detail[field] || 0) / parts.length;
+      });
+      return portion;
+    }).filter(portion => matchesBudgetDetail(portion, filters));
+  };
+  const aggregateCommitments = rows => {
+    const groups = new Map();
+    rows.forEach(row => {
+      if (!row.empenho || row.empenho === '-' || !key(row.empenho)) return;
+      const identity = [key(row.contrato), key(row.ug), key(row.empenho)].join('|');
+      if (!groups.has(identity)) groups.set(identity, {
+        identity,
+        label: `${row.empenho} | ${row.contrato || 'S/ CONTRATO'} | UG ${row.ug || 'N/I'}`,
+        contrato: row.contrato || '-',
+        empenho: row.empenho,
+        ug: row.ug || '-',
+        fornecedor: row.favorecido || '-',
+        contracts: new Set(),
+        descriptions: new Set(),
+        global: 0,
+        total: 0,
+        recebido: 0,
+        liquidado: 0,
+        pago: 0,
+        bloqueado: 0,
+        cancelado: 0
+      });
+      const group = groups.get(identity);
+      if (row.contrato && row.contrato !== '-') group.contracts.add(key(row.contrato));
+      group.descriptions.add(`Empenho: ${row.empenho} | Contrato: ${row.contrato || '-'} | Emitente: ${row.ug || '-'} | Favorecido: ${row.favorecido || '-'}`);
+      group.total += number(row.v_empenhado);
+      group.recebido += number(row.v_recebido);
+      group.liquidado += number(row.v_liquidado);
+      group.pago += number(row.v_pago);
+      group.bloqueado += number(row.v_bloqueado);
+      group.cancelado += number(row.v_cancelado);
+    });
+    return [...groups.values()].map(group => ({
+      ...group,
+      a_liquidar: group.total - group.liquidado - group.bloqueado - group.cancelado,
+      a_pagar: group.total - group.pago - group.bloqueado - group.cancelado,
+      executado: group.liquidado + group.bloqueado + group.cancelado
+    }));
+  };
   const budgetFields = {
     fAo: 'ao_filter',
     fPo: 'po_filter',
@@ -58,14 +152,22 @@ const UnifiedData = (() => {
     fNdCodigo: 'nd_codigo',
     fNdNome: 'nd_nome'
   };
-  const hasBudgetFilters = filters => Object.keys(budgetFields).some(field => (filters[field] || []).length);
-  const matchesBudgetDetail = (detail, filters) => Object.entries(budgetFields).every(_ref => {
-    let [field, property] = _ref;
-    const selected = filters[field] || [];
-    if (!selected.length) return true;
-    const values = Array.isArray(detail[property]) ? detail[property] : split(detail[property]);
-    return selected.some(value => values.includes(normalize(value)));
-  });
+  const hasBudgetFilters = filters => [...Object.keys(budgetFields), ...Object.keys(ndBudgetFields)].some(field => (filters[field] || []).length);
+  const matchesBudgetDetail = (detail, filters) => {
+    const scalarMatches = Object.entries(budgetFields).every(_ref => {
+      let [field, property] = _ref;
+      const selected = filters[field] || [];
+      if (!selected.length) return true;
+      const values = Array.isArray(detail[property]) ? detail[property] : split(detail[property]);
+      return selected.some(value => values.includes(normalize(value)));
+    });
+    if (!scalarMatches) return false;
+    if (!Object.keys(ndBudgetFields).some(field => (filters[field] || []).length)) return true;
+    return ndParts(detail).some(part => Object.entries(ndBudgetFields).every(_ref2 => {
+      let [field, property] = _ref2;
+      return !(filters[field] || []).length || filters[field].some(value => normalize(value) === part[property]);
+    }));
+  };
   const budgetIndex = rows => {
     const byContract = new Map(),
       byCommitment = new Map();
@@ -99,15 +201,15 @@ const UnifiedData = (() => {
         pi_nome: read(row, ['PI Nome']),
         nd_codigo: read(row, ['ND_DOC', 'ND Código', 'ND Codigo']),
         nd_nome: read(row, ['ND_NOME', 'ND Nome']),
+        ug: read(row, ['Emitente - UG Código', 'Emitente - UG Codigo', 'UG Emitente', 'UG Código', 'UG Codigo']),
         ptres: read(row, ['PTRES Código', 'PTRES Codigo', 'PTRES'])
       };
       const pair = (name, code) => name && name !== 'N/I' && name !== '-' ? `${name} – ${code || 'N/I'}` : code;
-      detail.ao_filter = pair(detail.ao_nome, detail.ao_codigo);
-      detail.po_filter = pair(detail.po_nome, detail.po_codigo);
+      detail.ao_filter = detail.ao_nome && detail.ao_nome !== 'N/I' && detail.ao_nome !== '-' ? `${detail.ao_codigo || 'N/I'} – ${detail.ao_nome}` : detail.ao_codigo;
+      detail.po_filter = detail.po_nome && detail.po_nome !== 'N/I' && detail.po_nome !== '-' ? `${detail.po_codigo || 'N/I'} – ${detail.po_nome}` : detail.po_codigo;
       detail.pi_filter = pair(detail.pi_nome, detail.pi_codigo);
-      const ndCodes = split(detail.nd_codigo),
-        ndNames = split(detail.nd_nome);
-      detail.nd_filter_values = ndCodes.map((code, i) => pair(ndNames[i] || (ndNames.length === 1 ? ndNames[0] : ''), code));
+      detail.nd_filter_values = ndParts(detail).map(part => pair(part.name, part.code));
+      Object.assign(detail, ndDimensionValues(detail));
       if (!byContract.has(contract)) byContract.set(contract, []);
       byContract.get(contract).push(detail);
       if (commitment) {
@@ -125,7 +227,7 @@ const UnifiedData = (() => {
     if (!hasBudgetFilters(filters)) return true;
     const contract = key(row.contrato);
     const candidates = row.existencia === 'GERAL' ? index.byContract.get(contract) : index.byCommitment.get(`${contract}|${key(row.empenho)}`);
-    return !!candidates && candidates.some(detail => matchesBudgetDetail(detail, filters));
+    return !!candidates && candidates.some(detail => (!detail.ug || !row.ug || key(detail.ug) === key(row.ug)) && matchesBudgetDetail(detail, filters));
   };
   const attachReceived = (details, received) => {
     const groups = new Map();
@@ -158,11 +260,386 @@ const UnifiedData = (() => {
     matchesBudgetDetail,
     matchesBudgetRow,
     hasBudgetFilters,
-    attachReceived
+    attachReceived,
+    ndParts,
+    ndDimensionValues,
+    budgetDetailPortions,
+    aggregateCommitments
   };
 })();
+const ContractRules = (() => {
+  const cents = value => Math.round(UnifiedData.number(value) * 100);
+  const metrics = ['v_empenhado', 'v_recebido', 'v_liquidado', 'v_pago', 'v_cancelado', 'v_bloqueado'];
+  const priority = ['VIG EXEC TOTAL', 'VIG EXEC PARCIAL', 'VIG EM EXEC', 'VIG SEM EXEC', 'VENC INEXEC TOTAL', 'VENC EXEC TOTAL', 'VENC EXEC PARCIAL'];
+  const primaryFlag = flags => priority.map(label => (flags || []).find(flag => flag.label === label)).find(Boolean) || (flags === null || flags === void 0 ? void 0 : flags[0]);
+  const midnight = value => {
+    const parsed = typeof value === 'number' ? value > 0 ? new Date(value) : null : UnifiedData.date(value);
+    return parsed && Number.isFinite(parsed.getTime()) ? new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()).getTime() : null;
+  };
+  const todayTime = now => midnight(now || new Date());
+  const phase = function (metadata) {
+    let now = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : new Date();
+    metadata = metadata.contract_metadata || metadata;
+    const today = todayTime(now);
+    const start = midnight(metadata.dtInicVal || metadata.data_inic);
+    const end = midnight(metadata.dtFimVal || metadata.data_fim);
+    if (end !== null && end < today) return 'vencido';
+    if (start !== null && end !== null && start <= today && end >= today) return 'vigente';
+    if (start !== null && start > today) return 'futuro';
+    return 'sem-data';
+  };
+  const classify = function (totals) {
+    let metadata = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : totals;
+    let documentMovement = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    let now = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : new Date();
+    const labels = [];
+    const values = Object.fromEntries(metrics.map(field => [field, cents(totals[field])]));
+    const movement = documentMovement || Object.values(values).some(value => value !== 0);
+    if (values.v_cancelado > 0) labels.push('CAN');
+    if (values.v_bloqueado > 0) labels.push('BLOQ');
+    const state = phase(metadata, now);
+    let execution = null;
+    // Specific outcomes precede the broader ongoing/no-receipt conditions.
+    // Only CAN and BLOQ are independent decorations of the execution status.
+    if (state === 'vigente') {
+      if (movement && values.v_empenhado === values.v_pago) execution = 'VIG EXEC TOTAL';else if (values.v_cancelado > 0 && values.v_empenhado === values.v_pago + values.v_cancelado) execution = 'VIG EXEC PARCIAL';else if (values.v_recebido > 0 && values.v_pago !== values.v_empenhado) execution = 'VIG EM EXEC';else if (values.v_recebido === 0) execution = 'VIG SEM EXEC';
+    } else if (state === 'vencido') {
+      if (values.v_pago === 0) execution = 'VENC INEXEC TOTAL';else if (values.v_empenhado === values.v_pago) execution = 'VENC EXEC TOTAL';else if (values.v_pago < values.v_empenhado) execution = 'VENC EXEC PARCIAL';
+    }
+    if (execution) labels.push(execution);
+    return {
+      labels,
+      state,
+      primary: execution || labels[0] || 'N/I'
+    };
+  };
+  const contractIndex = rows => {
+    const index = new Map();
+    const metadataFields = ['data_inic', 'data_fim', 'dtInicVal', 'dtFimVal', 'dias_passaram', 'perc_tempo', 'encerrando_dias', 'duracao_total_dias', 'ano_vig_ini', 'sec_log', 'fornecedor', 'fiscal', 'gestor', 'fiscal_sub', 'gestor_sub', 'modalidade', 'compra', 'objeto', 'v_global'];
+    const financialFields = [...metrics, 'v_executado', 'v_a_liquidar', 'v_a_pagar'];
+    const comparable = (field, value) => field === 'v_global' ? cents(value) : field.startsWith('dt') ? value || null : UnifiedData.normalize(value);
+    (rows || []).forEach(row => {
+      const id = UnifiedData.key(row.contrato);
+      if (!id || row.contrato === '-') return;
+      const metadata = row.contract_metadata || Object.fromEntries(metadataFields.map(field => [field, row[field]]));
+      if (!index.has(id)) index.set(id, {
+        metadata: {
+          ...metadata
+        },
+        totals: Object.fromEntries(financialFields.map(field => [field, 0])),
+        conflicts: new Set()
+      });
+      const entry = index.get(id);
+      metadataFields.forEach(field => {
+        if (comparable(field, metadata[field]) !== comparable(field, entry.metadata[field])) entry.conflicts.add(field);
+      });
+      (row.contract_metadata_conflicts || []).forEach(field => entry.conflicts.add(field));
+      financialFields.forEach(field => {
+        entry.totals[field] += UnifiedData.number(row[field]);
+      });
+    });
+    return index;
+  };
+  const aggregateContracts = rows => {
+    const firstRows = new Map();
+    (rows || []).forEach(row => {
+      const id = UnifiedData.key(row.contrato);
+      if (id && !firstRows.has(id)) firstRows.set(id, row);
+    });
+    return [...contractIndex(rows)].map(_ref3 => {
+      let [id, entry] = _ref3;
+      const row = {
+        ...firstRows.get(id),
+        ...entry.metadata,
+        ...entry.totals,
+        contract_metadata: entry.metadata,
+        contract_metadata_conflicts: [...entry.conflicts]
+      };
+      ['recebido', 'liquidado', 'pago', 'bloqueado', 'cancelado', 'executado', 'a_liquidar', 'a_pagar'].forEach(metric => {
+        row['p_' + metric] = row.v_empenhado ? (row['v_' + metric] || 0) / row.v_empenhado : 0;
+      });
+      row.p_exec_liq = row.p_pago;
+      row.dif_global = (row.v_global || 0) - row.v_empenhado;
+      row.contrato_empenhado_total = row.v_empenhado;
+      return row;
+    });
+  };
+  const accountingBalances = rows => {
+    const result = new Map();
+    if (!rows || rows.length < 2) return result;
+    const headers = rows[0].map(UnifiedData.key);
+    const find = names => names.map(UnifiedData.key).map(name => headers.indexOf(name)).find(index => index >= 0) ?? -1;
+    const contractIndex = find(['COL_NR_CONTR_BASE', 'Contrato', 'Número Contrato', 'Numero Contrato']);
+    const informationIndex = find(['ITEM_INFORMACAO', 'INTEN_INFORMACAO', 'Informação', 'Informacao']);
+    const valueIndex = find(['Valor Item (R$)', 'Valor (R$)', 'VALOR', 'Valor']);
+    if (contractIndex < 0 || informationIndex < 0 || valueIndex < 0) return result;
+    const names = {
+      EMPENHADO: 'v_empenhado',
+      RECEBIDO: 'v_recebido',
+      LIQUIDADO: 'v_liquidado',
+      PAGO: 'v_pago',
+      CANCELADO: 'v_cancelado',
+      BLOQUEADO: 'v_bloqueado'
+    };
+    rows.slice(1).forEach(row => {
+      const contract = UnifiedData.key(row[contractIndex]);
+      const information = UnifiedData.normalize(row[informationIndex]);
+      const name = Object.keys(names).find(label => information.includes(label));
+      if (!contract || !name) return;
+      if (!result.has(contract)) result.set(contract, {
+        ...Object.fromEntries(metrics.map(field => [field, 0])),
+        hasMovement: false
+      });
+      const target = result.get(contract);
+      target[names[name]] += UnifiedData.number(row[valueIndex]);
+      target.hasMovement = true;
+    });
+    return result;
+  };
+  const bounds = function () {
+    let now = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : new Date();
+    const today = new Date(todayTime(now));
+    const monday = new Date(today);
+    monday.setDate(today.getDate() - (today.getDay() + 6) % 7);
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    const future30 = new Date(today);
+    future30.setDate(today.getDate() + 30);
+    const recent7 = new Date(today);
+    recent7.setDate(today.getDate() - 6);
+    return {
+      today: today.getTime(),
+      monday: monday.getTime(),
+      sunday: sunday.getTime(),
+      future30: future30.getTime(),
+      recent7: recent7.getTime()
+    };
+  };
+  const formatDate = timestamp => new Intl.DateTimeFormat('pt-BR').format(new Date(timestamp));
+  const loginSummary = function (contracts, documents) {
+    let now = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : new Date();
+    const period = bounds(now);
+    const unique = new Map();
+    (contracts || []).forEach(row => {
+      const id = UnifiedData.key(row.contrato);
+      if (id && row.contrato !== '-' && !unique.has(id)) unique.set(id, row);
+    });
+    const sections = new Map();
+    let totalCount = 0,
+      totalCents = 0,
+      weekCount = 0,
+      next30Count = 0;
+    unique.forEach(row => {
+      const metadata = row.contract_metadata || row;
+      const end = midnight(metadata.dtFimVal || metadata.data_fim);
+      if (end !== null && end >= period.monday && end <= period.sunday) weekCount++;
+      if (end !== null && end >= period.today && end <= period.future30) next30Count++;
+      if (phase(row, now) !== 'vigente') return;
+      const section = metadata.sec_log && metadata.sec_log !== '-' ? metadata.sec_log : 'N/I';
+      if (!sections.has(section)) sections.set(section, {
+        section,
+        count: 0,
+        valueCents: 0
+      });
+      const target = sections.get(section);
+      target.count++;
+      target.valueCents += cents(metadata.v_global);
+      totalCount++;
+      totalCents += cents(metadata.v_global);
+    });
+    const movements = {
+      pago: {
+        field: 'v_pago',
+        count: new Set(),
+        valueCents: 0
+      },
+      liquidado: {
+        field: 'v_liquidado',
+        count: new Set(),
+        valueCents: 0
+      },
+      empenhado: {
+        field: 'v_empenhado',
+        count: new Set(),
+        valueCents: 0
+      }
+    };
+    (documents || []).forEach(row => {
+      const day = midnight(row.diaVal || row.dia);
+      if (day === null || day < period.recent7 || day > period.today || !row.documento || row.documento === '-') return;
+      Object.values(movements).forEach(target => {
+        if (!row[target.field.replace('v_', 'has_')]) return;
+        target.count.add(UnifiedData.documentId(row));
+        target.valueCents += cents(row[target.field]);
+      });
+    });
+    return {
+      period,
+      totalCount,
+      totalValue: totalCents / 100,
+      weekCount,
+      next30Count,
+      sections: [...sections.values()].sort((a, b) => a.section.localeCompare(b.section, 'pt-BR')).map(row => ({
+        section: row.section,
+        count: row.count,
+        value: row.valueCents / 100
+      })),
+      movements: Object.fromEntries(Object.entries(movements).map(_ref4 => {
+        let [name, row] = _ref4;
+        return [name, {
+          count: row.count.size,
+          value: row.valueCents / 100
+        }];
+      }))
+    };
+  };
+  const accessText = control => {
+    const limit = Number(control === null || control === void 0 ? void 0 : control.limite);
+    if (!Number.isFinite(limit) || limit <= 0) return 'Sem limite diário de acessos';
+    const remaining = control.restantes !== null && control.restantes !== undefined ? Number(control.restantes) : Math.max(0, limit - Number(control.usados || 0));
+    const timezone = control.fuso ? `; reinício às 00:00 em ${control.fuso}` : '; reinício à meia-noite no fuso da Api';
+    return `Acessos restantes (por usuário/dia; 1 por carga ou sincronização${timezone}): ${remaining}`;
+  };
+  return Object.freeze({
+    cents,
+    phase,
+    classify,
+    primaryFlag,
+    contractIndex,
+    aggregateContracts,
+    accountingBalances,
+    bounds,
+    formatDate,
+    loginSummary,
+    accessText
+  });
+})();
+function LoginSummaryModal(_ref5) {
+  let {
+    summary,
+    user,
+    onClose
+  } = _ref5;
+  const closeRef = useRef(null);
+  useEffect(() => {
+    var _closeRef$current;
+    const previous = document.activeElement;
+    (_closeRef$current = closeRef.current) === null || _closeRef$current === void 0 || _closeRef$current.focus();
+    const keydown = event => {
+      if (event.key === 'Escape') onClose();
+      if (event.key === 'Tab') {
+        var _closeRef$current2;
+        event.preventDefault();
+        (_closeRef$current2 = closeRef.current) === null || _closeRef$current2 === void 0 || _closeRef$current2.focus();
+      }
+    };
+    document.addEventListener('keydown', keydown);
+    const oldOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      var _previous$focus;
+      document.removeEventListener('keydown', keydown);
+      document.body.style.overflow = oldOverflow;
+      previous === null || previous === void 0 || (_previous$focus = previous.focus) === null || _previous$focus === void 0 || _previous$focus.call(previous);
+    };
+  }, [onClose]);
+  if (!summary) return null;
+  const p = summary.period;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 p-3 md:p-6"
+  }, /*#__PURE__*/React.createElement("section", {
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "login-summary-title",
+    className: "max-h-[92vh] w-full max-w-4xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl md:p-8"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mb-5 flex items-start justify-between gap-4"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    id: "login-summary-title",
+    className: "text-xl font-black text-slate-800"
+  }, "Resumo de entrada"), /*#__PURE__*/React.createElement("p", {
+    className: "mt-1 text-sm text-slate-500"
+  }, user, " \xB7 ", ContractRules.formatDate(p.today))), /*#__PURE__*/React.createElement("button", {
+    ref: closeRef,
+    onClick: onClose,
+    className: "rounded-lg bg-slate-800 px-4 py-2 text-sm font-bold text-white"
+  }, "Abrir painel")), /*#__PURE__*/React.createElement("p", {
+    className: "mb-5 text-xs text-slate-500"
+  }, "Resumo de todos os dados permitidos para seu usu\xE1rio, antes dos filtros do painel."), /*#__PURE__*/React.createElement("h3", {
+    className: "mb-3 text-sm font-black uppercase text-slate-700"
+  }, "Contratos vigentes"), /*#__PURE__*/React.createElement("div", {
+    className: "overflow-x-auto rounded-lg border border-slate-200"
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full text-left text-sm"
+  }, /*#__PURE__*/React.createElement("thead", {
+    className: "bg-slate-100"
+  }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    className: "p-3"
+  }, "SEC LOG"), /*#__PURE__*/React.createElement("th", {
+    className: "p-3 text-right"
+  }, "Contratos"), /*#__PURE__*/React.createElement("th", {
+    className: "p-3 text-right"
+  }, "Valor contratado"))), /*#__PURE__*/React.createElement("tbody", null, summary.sections.map(row => /*#__PURE__*/React.createElement("tr", {
+    key: row.section,
+    className: "border-t border-slate-100"
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "p-3 font-bold"
+  }, row.section), /*#__PURE__*/React.createElement("td", {
+    className: "p-3 text-right"
+  }, row.count.toLocaleString('pt-BR')), /*#__PURE__*/React.createElement("td", {
+    className: "p-3 text-right tabular-nums"
+  }, formatBRL(row.value)))), summary.sections.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "3",
+    className: "p-3 text-slate-500"
+  }, "Nenhum contrato vigente nas bases permitidas."))), /*#__PURE__*/React.createElement("tfoot", {
+    className: "bg-slate-800 font-black text-white"
+  }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    className: "p-3"
+  }, "TOTAL GERAL"), /*#__PURE__*/React.createElement("td", {
+    className: "p-3 text-right"
+  }, summary.totalCount.toLocaleString('pt-BR')), /*#__PURE__*/React.createElement("td", {
+    className: "p-3 text-right tabular-nums"
+  }, formatBRL(summary.totalValue)))))), /*#__PURE__*/React.createElement("div", {
+    className: "my-5 grid gap-3 sm:grid-cols-2"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "rounded-xl border border-slate-200 p-4"
+  }, /*#__PURE__*/React.createElement("h3", {
+    className: "text-sm font-bold text-slate-700"
+  }, "Vencendo nesta semana"), /*#__PURE__*/React.createElement("p", {
+    className: "mt-1 text-xs text-slate-500"
+  }, "Segunda a domingo: ", ContractRules.formatDate(p.monday), " a ", ContractRules.formatDate(p.sunday)), /*#__PURE__*/React.createElement("p", {
+    className: "mt-2 text-2xl font-black text-blue-700"
+  }, summary.weekCount.toLocaleString('pt-BR'), " contratos")), /*#__PURE__*/React.createElement("div", {
+    className: "rounded-xl border border-slate-200 p-4"
+  }, /*#__PURE__*/React.createElement("h3", {
+    className: "text-sm font-bold text-slate-700"
+  }, "Vencendo nos pr\xF3ximos 30 dias"), /*#__PURE__*/React.createElement("p", {
+    className: "mt-1 text-xs text-slate-500"
+  }, "De ", ContractRules.formatDate(p.today), " a ", ContractRules.formatDate(p.future30), ", inclusive"), /*#__PURE__*/React.createElement("p", {
+    className: "mt-2 text-2xl font-black text-blue-700"
+  }, summary.next30Count.toLocaleString('pt-BR'), " contratos"))), /*#__PURE__*/React.createElement("h3", {
+    className: "mb-1 text-sm font-black uppercase text-slate-700"
+  }, "\xDAltimas movimenta\xE7\xF5es dos 7 dias"), /*#__PURE__*/React.createElement("p", {
+    className: "mb-3 text-xs text-slate-500"
+  }, ContractRules.formatDate(p.recent7), " a ", ContractRules.formatDate(p.today), ", inclusive. Valores dos lan\xE7amentos do per\xEDodo."), /*#__PURE__*/React.createElement("div", {
+    className: "grid gap-3 sm:grid-cols-3"
+  }, [['pago', 'Pagos'], ['liquidado', 'Liquidados'], ['empenhado', 'Empenhados']].map(_ref6 => {
+    let [metric, label] = _ref6;
+    return /*#__PURE__*/React.createElement("div", {
+      key: metric,
+      className: "rounded-xl border-t-4 border border-slate-200 p-4",
+      style: MetricColors.cardStyle(metric)
+    }, /*#__PURE__*/React.createElement("h4", {
+      className: "text-sm font-bold"
+    }, label), /*#__PURE__*/React.createElement("p", {
+      className: "mt-2 text-lg font-black"
+    }, formatBRL(summary.movements[metric].value)), /*#__PURE__*/React.createElement("p", {
+      className: "mt-1 text-xs text-slate-500"
+    }, summary.movements[metric].count.toLocaleString('pt-BR'), " documentos"));
+  }))));
+}
 
-// V2: one palette for the same financial metric across every page.
+// V3: one palette for the same financial metric across every page.
 const MetricColors = (() => {
   const palette = Object.freeze({
     global: Object.freeze({
@@ -329,17 +806,17 @@ const MetricColors = (() => {
 const QuickActionHelp = (() => {
   const date = value => String(value || '').split('-').reverse().join('/');
   const contractDateNote = ' Ao ativar, substitui os filtros de início e fim da vigência. Clique novamente para retirar esse recorte. Os demais filtros continuam valendo.';
-  const statusNote = ' A classificação usa os totais do contrato. Se marcar mais de uma situação, basta atender a uma delas; os outros filtros continuam valendo.';
+  const statusNote = ' As comparações são feitas em centavos. As situações de execução são exclusivas; somente CAN e BLOQ podem aparecer junto delas. Se selecionar várias situações, basta atender a uma delas. Os demais filtros continuam valendo.';
   const statuses = Object.freeze({
-    'ATIVO INEXEC': 'Contrato que ainda não venceu e tem total liquidado de R$ 0,01 ou menos.',
-    'ATIVO EM EXEC': 'Contrato que ainda não venceu, já liquidou mais de R$ 0,01 e tem total executado mais de R$ 0,01 abaixo do empenhado.',
-    'ATIVO EXEC TOT': 'Contrato que ainda não venceu, com empenho maior que zero e liquidação acima de R$ 0,01. O executado e o pago cobrem o empenhado, aceitando até R$ 0,01 a menos em cada comparação.',
-    'ATIVO EXEC PARC': 'Contrato que ainda não venceu, com empenho maior que zero e liquidação acima de R$ 0,01. O executado cobre o empenhado, aceitando até R$ 0,01 a menos, mas ainda falta pagar mais de R$ 0,01.',
-    'VENC INEXEC TOT': 'Contrato cujo fim da vigência já passou e tem total pago de R$ 0,01 ou menos. Ele pode ter valores liquidados ou executados; este critério olha o pagamento.',
-    'VENC EXEC TOT': 'Contrato cujo fim da vigência já passou, com empenho maior que zero e pagamento acima de R$ 0,01. O pago cobre o empenhado, aceitando até R$ 0,01 a menos.',
-    'VENC EXEC PARC': 'Contrato cujo fim da vigência já passou, com empenho maior que zero e pagamento acima de R$ 0,01. O executado cobre o empenhado, aceitando até R$ 0,01 a menos, mas ainda falta pagar mais de R$ 0,01.',
-    'CAN': 'Mostra contratos com total cancelado maior que zero. Isso não significa, necessariamente, que todo o contrato foi cancelado.',
-    'BLOQ': 'Mostra contratos com total bloqueado maior que zero. Isso não significa, necessariamente, que todo o contrato está bloqueado.'
+    'VIG SEM EXEC': 'Contrato vigente, com início até hoje e fim hoje ou depois, cujo recebido é zero e que não se enquadra em execução total ou parcial. Sem qualquer movimentação, permanece nesta situação.',
+    'VIG EM EXEC': 'Contrato vigente com recebido maior que zero e pago diferente do empenhado, que não se enquadra em execução parcial por cancelamento.',
+    'VIG EXEC PARCIAL': 'Contrato vigente com cancelado maior que zero, em que o empenhado é igual à soma do pago com o cancelado. Tem prioridade sobre em execução e sem execução.',
+    'VIG EXEC TOTAL': 'Contrato vigente em que o pago é igual ao empenhado. Se ambos forem zero e não houver nenhuma movimentação, a situação será VIG SEM EXEC.',
+    'VENC INEXEC TOTAL': 'Contrato com fim da vigência anterior a hoje, cujo pago é igual a zero. Tem prioridade sobre as demais situações de contrato vencido.',
+    'VENC EXEC TOTAL': 'Contrato com fim da vigência anterior a hoje, cujo pago é igual ao empenhado. Se o pago for zero, a situação será VENC INEXEC TOTAL.',
+    'VENC EXEC PARCIAL': 'Contrato com fim da vigência anterior a hoje, cujo pago é menor que o empenhado. Se o pago for zero, a situação será VENC INEXEC TOTAL.',
+    'CAN': 'Contrato com valor cancelado maior que zero. Não exige cancelamento integral.',
+    'BLOQ': 'Contrato com valor bloqueado maior que zero. Não exige bloqueio integral.'
   });
   const movements = Object.freeze({
     EMP: 'empenho',
@@ -541,31 +1018,31 @@ Chart.register(fiftyPercentLinePlugin);
 
 // Mapa de cores unificado para TAGS de Situação e Gráfico de Dispersão
 const tagColorsMap = {
-  'ATIVO INEXEC': {
+  'VIG SEM EXEC': {
     css: 'bg-purple-700 text-white',
     hex: '#7e22ce'
   },
-  'ATIVO EM EXEC': {
+  'VIG EM EXEC': {
     css: 'bg-cyan-500 text-slate-900',
     hex: '#06b6d4'
   },
-  'ATIVO EXEC TOT': {
+  'VIG EXEC TOTAL': {
     css: 'bg-blue-800 text-white',
     hex: '#1e40af'
   },
-  'ATIVO EXEC PARC': {
+  'VIG EXEC PARCIAL': {
     css: 'bg-sky-400 text-slate-900',
     hex: '#38bdf8'
   },
-  'VENC INEXEC TOT': {
+  'VENC INEXEC TOTAL': {
     css: 'bg-rose-900 text-white',
     hex: '#881337'
   },
-  'VENC EXEC TOT': {
+  'VENC EXEC TOTAL': {
     css: 'bg-green-600 text-white',
     hex: '#16a34a'
   },
-  'VENC EXEC PARC': {
+  'VENC EXEC PARCIAL': {
     css: 'bg-yellow-500 text-slate-900',
     hex: '#eab308'
   },
@@ -599,9 +1076,9 @@ const normalizeStr = str => {
 
 // Implantação V1_GPT, compatível com o Code.gs orçamentário por documento CCor.
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwDf4gT-FPusNrbuXS0t-dE-LCLmqXmMVG7QX34GuQUHWc3EwjEargr1Mdi4DeXwpxf/exec";
-const DASH_CACHE_KEY = 'dashData_TotalV2_total_v2';
-const DASH_VERSION = 'V2_GPT';
-const AUTH_STORAGE_KEYS = ['token_TotalV2', 'user_TotalV2', 'perfil_TotalV2', 'ativo_TotalV2', 'validade_TotalV2', 'duracao_diaria_horas_TotalV2', 'expira_TotalV2'];
+const DASH_CACHE_KEY = 'dashData_TotalV3_total_v3';
+const DASH_VERSION = 'V3';
+const AUTH_STORAGE_KEYS = ['summary_pending_TotalV3', 'token_TotalV3', 'user_TotalV3', 'perfil_TotalV3', 'ativo_TotalV3', 'validade_TotalV3', 'duracao_diaria_horas_TotalV3', 'expira_TotalV3'];
 const clearAuthStorage = () => {
   try {
     AUTH_STORAGE_KEYS.forEach(key => sessionStorage.removeItem(key));
@@ -609,9 +1086,9 @@ const clearAuthStorage = () => {
 };
 const isAuthSessionValid = () => {
   try {
-    const token = sessionStorage.getItem('token_TotalV2');
+    const token = sessionStorage.getItem('token_TotalV3');
     if (!token) return false;
-    const expiraEm = Number(sessionStorage.getItem('expira_TotalV2') || 0);
+    const expiraEm = Number(sessionStorage.getItem('expira_TotalV3') || 0);
     if (expiraEm && Date.now() > expiraEm) {
       clearAuthStorage();
       return false;
@@ -716,130 +1193,369 @@ const formatExportCell = (row, column) => {
   if (column.isCurrency) return formatBRL(value);
   return value;
 };
+const ExportData = (() => {
+  const numeric = value => typeof value === 'number' && Number.isFinite(value);
+  const joinedLabel = value => Array.isArray(value) ? value.join(' ') : String(value == null ? '' : value);
+  const moneySeries = label => !/QTD|QUANT|CONTRATOS|INICIADOS|ENCERRADOS|DURANTE/i.test(label) && /EMPENH|RECEB|LIQUID|PAGO|BLOQ|CANCEL|VALOR|GLOBAL|EXECUTADO/i.test(label);
+  const pointNames = {
+    contrato: 'CONTRATO',
+    situacao: 'SITUAÇÃO',
+    fornecedor: 'FORNECEDOR',
+    objeto: 'OBJETO',
+    sec_log: 'SEC LOG',
+    empenho: 'EMPENHO',
+    dia: 'DIA',
+    v_global: 'GLOBAL',
+    v_empenhado: 'EMPENHADO',
+    v_recebido: 'RECEBIDO',
+    v_liquidado: 'LIQUIDADO',
+    v_pago: 'PAGO',
+    v_cancelado: 'CANCELADO',
+    v_bloqueado: 'BLOQUEADO',
+    perc_tempo: '% TEMPO',
+    dias_passaram: 'DIAS DECORRIDOS',
+    duracao_total_dias: 'DURAÇÃO EM DIAS',
+    encerrando_dias: 'DIAS RESTANTES',
+    r: 'TAMANHO DA BOLHA'
+  };
+  const chartRows = (data, type, chart, percentUnit, id) => {
+    const datasets = ((data === null || data === void 0 ? void 0 : data.datasets) || []).map((dataset, index) => ({
+      dataset,
+      index
+    })).filter(_ref7 => {
+      let {
+        dataset,
+        index
+      } = _ref7;
+      return dataset.hidden !== true && (!(chart !== null && chart !== void 0 && chart.isDatasetVisible) || chart.isDatasetVisible(index));
+    });
+    const visiblePoint = index => !(type === 'pie' || type === 'doughnut') || !(chart !== null && chart !== void 0 && chart.getDataVisibility) || chart.getDataVisibility(index);
+    const objectData = datasets.some(_ref8 => {
+      let {
+        dataset
+      } = _ref8;
+      return (dataset.data || []).some(point => point && typeof point === 'object' && !Array.isArray(point));
+    });
+    if (objectData) {
+      const rows = [],
+        keys = new Set();
+      datasets.forEach(_ref9 => {
+        let {
+          dataset,
+          index
+        } = _ref9;
+        return (dataset.data || []).forEach((point, pointIndex) => {
+          if (!visiblePoint(pointIndex) || !point || typeof point !== 'object') return;
+          const contractPoint = Object.prototype.hasOwnProperty.call(point, 'contrato') || Object.prototype.hasOwnProperty.call(point, 'v_empenhado');
+          const row = {
+            serie: dataset.label || `SÉRIE ${index + 1}`,
+            ...point
+          };
+          if (!contractPoint) {
+            var _data$labels;
+            row.periodo = point.x ?? ((_data$labels = data.labels) === null || _data$labels === void 0 ? void 0 : _data$labels[pointIndex]) ?? '';
+            row.valor = point.y ?? null;
+            delete row.x;
+            delete row.y;
+          }
+          Object.keys(row).forEach(key => {
+            if (key !== 'color' && !key.startsWith('_') && (row[key] === null || typeof row[key] !== 'object')) keys.add(key);
+          });
+          rows.push(row);
+        });
+      });
+      const monetaryY = datasets.every(_ref10 => {
+        let {
+          dataset
+        } = _ref10;
+        return moneySeries(dataset.label || '');
+      });
+      return {
+        rows,
+        columns: [...keys].map(key => ({
+          header: key === 'serie' ? 'SÉRIE' : key === 'periodo' ? 'PERÍODO' : key === 'valor' ? 'VALOR' : key === 'x' ? 'EIXO X (%)' : key === 'y' ? 'EIXO Y (%)' : pointNames[key] || key.replace(/_/g, ' ').toUpperCase(),
+          key,
+          isCurrency: key.startsWith('v_') || key === 'valor' && monetaryY,
+          isPercent: key.startsWith('p_') || key === 'perc_tempo',
+          format: ['x', 'y'].includes(key) ? row => numeric(row[key]) ? `${row[key].toLocaleString('pt-BR', {
+            maximumFractionDigits: 2
+          })}%` : joinedLabel(row[key]) : undefined
+        }))
+      };
+    }
+    const rows = ((data === null || data === void 0 ? void 0 : data.labels) || []).flatMap((label, index) => {
+      if (!visiblePoint(index)) return [];
+      const row = {
+        subject: joinedLabel(label)
+      };
+      datasets.forEach(_ref11 => {
+        var _dataset$data;
+        let {
+          dataset,
+          index: datasetIndex
+        } = _ref11;
+        row[`dataset_${datasetIndex}`] = ((_dataset$data = dataset.data) === null || _dataset$data === void 0 ? void 0 : _dataset$data[index]) ?? null;
+      });
+      return [row];
+    });
+    const columns = [{
+      header: 'ASSUNTO',
+      key: 'subject'
+    }, ...datasets.map(_ref12 => {
+      let {
+        dataset,
+        index
+      } = _ref12;
+      const label = dataset.label || `SÉRIE ${index + 1}`,
+        isPercent = label.includes('%');
+      const unit = dataset.exportPercentUnit || percentUnit || (id === 'gContrato' ? 'fraction' : 'percent');
+      return {
+        header: label.toUpperCase(),
+        key: `dataset_${index}`,
+        isCurrency: !isPercent && moneySeries(label),
+        format: isPercent ? row => unit === 'fraction' ? formatPercentBR(row[`dataset_${index}`]) : `${Number(row[`dataset_${index}`] || 0).toLocaleString('pt-BR', {
+          maximumFractionDigits: 2
+        })}%` : undefined
+      };
+    })];
+    if ((type === 'pie' || type === 'doughnut') && datasets.length === 1) {
+      const {
+          dataset,
+          index
+        } = datasets[0],
+        total = (dataset.data || []).reduce((sum, value) => sum + Number(value || 0), 0);
+      rows.forEach(row => {
+        row.share = total ? Number(row[`dataset_${index}`] || 0) / total : 0;
+      });
+      columns.push({
+        header: '% DA SÉRIE',
+        key: 'share',
+        isPercent: true
+      });
+    }
+    return {
+      rows,
+      columns
+    };
+  };
+  const wrap = (context, text, width) => {
+    const lines = [];
+    String(text || '').split(/\r?\n/).forEach(paragraph => {
+      let line = '';
+      paragraph.split(/\s+/).forEach(word => {
+        if (line && context.measureText(`${line} ${word}`).width > width) {
+          lines.push(line);
+          line = '';
+        }
+        if (context.measureText(word).width > width) {
+          if (line) {
+            lines.push(line);
+            line = '';
+          }
+          for (const character of word) {
+            if (context.measureText(line + character).width > width) {
+              lines.push(line);
+              line = '';
+            }
+            line += character;
+          }
+        } else line += (line ? ' ' : '') + word;
+      });
+      lines.push(line);
+    });
+    return lines;
+  };
+  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref13 => {
+    let [key, item] = _ref13;
+    return [key, clone(item)];
+  })) : value;
+  const png = async (canvas, filename, title, chartConfig, visibleChart) => {
+    if (!canvas) {
+      alert('Gráfico não encontrado para exportação.');
+      return;
+    }
+    let chart,
+      holder,
+      image = canvas;
+    try {
+      var _document$fonts;
+      if ((_document$fonts = document.fonts) !== null && _document$fonts !== void 0 && _document$fonts.ready) await document.fonts.ready;
+      if (chartConfig) {
+        var _chartConfig$options, _chartConfig$data$lab, _config$options, _config$options2, _config$options3;
+        holder = document.createElement('div');
+        holder.style.cssText = 'position:fixed;left:-100000px;top:0;pointer-events:none;';
+        image = document.createElement('canvas');
+        holder.appendChild(image);
+        document.body.appendChild(holder);
+        const horizontal = ((_chartConfig$options = chartConfig.options) === null || _chartConfig$options === void 0 ? void 0 : _chartConfig$options.indexAxis) === 'y';
+        image.width = Math.max(1600, Math.min(2600, canvas.width));
+        image.height = horizontal ? Math.min(16000, Math.max(900, (((_chartConfig$data$lab = chartConfig.data.labels) === null || _chartConfig$data$lab === void 0 ? void 0 : _chartConfig$data$lab.length) || 1) * 34 + 260)) : Math.max(1000, Math.min(1600, Math.round(image.width * canvas.height / Math.max(canvas.width, 1))));
+        const config = clone(chartConfig);
+        config.options = {
+          ...config.options,
+          responsive: false,
+          maintainAspectRatio: false,
+          animation: false,
+          devicePixelRatio: 1,
+          layout: {
+            padding: {
+              top: 70,
+              right: 120,
+              bottom: 90,
+              left: 120
+            }
+          },
+          plugins: {
+            ...((_config$options = config.options) === null || _config$options === void 0 ? void 0 : _config$options.plugins),
+            legend: {
+              ...((_config$options2 = config.options) === null || _config$options2 === void 0 || (_config$options2 = _config$options2.plugins) === null || _config$options2 === void 0 ? void 0 : _config$options2.legend),
+              labels: {
+                ...((_config$options3 = config.options) === null || _config$options3 === void 0 || (_config$options3 = _config$options3.plugins) === null || _config$options3 === void 0 || (_config$options3 = _config$options3.legend) === null || _config$options3 === void 0 ? void 0 : _config$options3.labels),
+                font: {
+                  size: 12
+                },
+                padding: 16
+              }
+            }
+          }
+        };
+        config.data.datasets = config.data.datasets.map((dataset, index) => ({
+          ...dataset,
+          hidden: visibleChart !== null && visibleChart !== void 0 && visibleChart.isDatasetVisible ? !visibleChart.isDatasetVisible(index) : dataset.hidden
+        }));
+        chart = new Chart(image.getContext('2d'), config);
+        if (visibleChart !== null && visibleChart !== void 0 && visibleChart.getDataVisibility && ['pie', 'doughnut'].includes(config.type)) config.data.labels.forEach((_, index) => {
+          if (!visibleChart.getDataVisibility(index)) chart.toggleDataVisibility(index);
+        });
+        chart.update('none');
+      }
+      const output = document.createElement('canvas'),
+        context = output.getContext('2d');
+      const scale = Math.max(1, image.width / 1100),
+        padding = Math.ceil(26 * scale),
+        lineHeight = Math.ceil(20 * scale);
+      output.width = image.width + padding * 2;
+      context.font = `800 ${Math.ceil(17 * scale)}px Outfit, Arial, sans-serif`;
+      const titleLines = wrap(context, String(title || 'Gráfico').toUpperCase(), image.width);
+      context.font = `600 ${Math.ceil(11 * scale)}px Outfit, Arial, sans-serif`;
+      const metadataLines = getExportMetadata().flatMap(line => wrap(context, line, image.width));
+      const headerHeight = padding * 2 + titleLines.length * lineHeight;
+      const footerHeight = padding * 2 + metadataLines.length * lineHeight;
+      output.height = image.height + headerHeight + footerHeight;
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, output.width, output.height);
+      context.fillStyle = '#1e293b';
+      context.font = `800 ${Math.ceil(17 * scale)}px Outfit, Arial, sans-serif`;
+      titleLines.forEach((line, index) => context.fillText(line, padding, padding + (index + 1) * lineHeight));
+      context.drawImage(image, padding, headerHeight);
+      context.fillStyle = '#475569';
+      context.font = `600 ${Math.ceil(11 * scale)}px Outfit, Arial, sans-serif`;
+      metadataLines.forEach((line, index) => context.fillText(line, padding, headerHeight + image.height + padding + (index + 1) * lineHeight));
+      const link = document.createElement('a');
+      link.download = `${sanitizeFilename(filename)}.png`;
+      link.href = output.toDataURL('image/png');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (error) {
+      console.error(error);
+      alert('Não foi possível exportar a imagem completa. Tente novamente após o gráfico terminar de carregar.');
+    } finally {
+      if (chart) chart.destroy();
+      if (holder) holder.remove();
+    }
+  };
+  return {
+    numeric,
+    chartRows,
+    wrap,
+    png
+  };
+})();
 const exportTable = {
   toExcel: (data, filename, columns) => {
     if (!window.XLSX) {
-      alert("Biblioteca Excel não encontrada.");
+      alert('Biblioteca Excel não encontrada.');
       return;
     }
-    const metadata = getExportMetadata();
-    const rows = [columns.map(column => column.header), ...data.map(row => columns.map(column => formatExportCell(row, column))), [], ...metadata.map(line => [line])];
+    const value = (row, column) => !column.format && ExportData.numeric(row[column.key]) ? row[column.key] : formatExportCell(row, column);
+    const rows = [columns.map(column => column.header), ...data.map(row => columns.map(column => value(row, column))), [], ...getExportMetadata().map(line => [line])];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = columns.map(column => ({
-      wch: Math.min(32, Math.max(10, column.header.length + 2))
+    columns.forEach((column, index) => data.forEach((row, rowIndex) => {
+      const cell = ws[XLSX.utils.encode_cell({
+        r: rowIndex + 1,
+        c: index
+      })];
+      if ((cell === null || cell === void 0 ? void 0 : cell.t) === 'n') cell.z = column.isCurrency ? '"R$" #,##0.00;[Red]-"R$" #,##0.00' : column.isPercent ? '0.00%' : '#,##0.00';
+    }));
+    ws['!cols'] = columns.map((column, index) => ({
+      wch: Math.min(60, Math.max(12, ...rows.slice(0, 101).map(row => String(row[index] ?? '').length + 2)))
     }));
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Dados");
+    XLSX.utils.book_append_sheet(wb, ws, 'Dados');
     XLSX.writeFile(wb, `${sanitizeFilename(filename)}.xlsx`);
   },
   toCSV: (data, filename, columns) => {
-    let csvContent = "\uFEFF";
-    csvContent += columns.map(c => c.header).join(";") + "\n";
-    data.forEach(row => {
-      let r = columns.map(c => {
-        const val = formatExportCell(row, c);
-        if (typeof val === 'number') return val.toString().replace('.', ',');
-        return `"${String(val).replace(/"/g, '""')}"`;
-      });
-      csvContent += r.join(";") + "\n";
-    });
-    csvContent += "\n" + getExportMetadata().map(line => `"${line.replace(/"/g, '""')}"`).join("\n");
-    const encodedUri = URL.createObjectURL(new Blob([csvContent], {
-      type: "text/csv;charset=utf-8;"
+    const escape = value => `"${String(value == null ? '' : value).replace(/"/g, '""')}"`;
+    const rows = [columns.map(column => column.header), ...data.map(row => columns.map(column => formatExportCell(row, column))), [], ...getExportMetadata().map(line => [line])];
+    const text = '\uFEFF' + rows.map(row => row.map(value => escape(typeof value === 'number' ? value.toString().replace('.', ',') : value)).join(';')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([text], {
+      type: 'text/csv;charset=utf-8;'
     }));
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `${sanitizeFilename(filename)}.csv`);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${sanitizeFilename(filename)}.csv`;
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(encodedUri), 1000);
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
   toPDF: (data, filename, columns, title) => {
-    if (!window.jspdf || !window.jspdf.jsPDF) {
-      alert("Biblioteca PDF não encontrada.");
+    var _window$jspdf;
+    if (!((_window$jspdf = window.jspdf) !== null && _window$jspdf !== void 0 && _window$jspdf.jsPDF)) {
+      alert('Biblioteca PDF não encontrada.');
       return;
     }
-    const {
-      jsPDF
-    } = window.jspdf;
-    const doc = new jsPDF('l', 'pt', 'a4');
-    const metadata = getExportMetadata();
-    doc.setFontSize(14);
-    doc.text(title, 40, 30);
-    const tableHead = [columns.map(c => c.header)];
-    const tableBody = data.map(row => columns.map(c => String(formatExportCell(row, c))));
+    const doc = new window.jspdf.jsPDF('l', 'pt', columns.length > 8 ? 'a3' : 'a4');
+    const width = doc.internal.pageSize.getWidth(),
+      height = doc.internal.pageSize.getHeight();
+    doc.setFontSize(13);
+    const heading = doc.splitTextToSize(String(title || filename), width - 64),
+      top = 28 + heading.length * 16;
     doc.autoTable({
-      head: tableHead,
-      body: tableBody,
-      startY: 40,
+      head: [columns.map(column => column.header)],
+      body: data.map(row => columns.map(column => String(formatExportCell(row, column)))),
+      startY: top,
+      horizontalPageBreak: true,
+      horizontalPageBreakRepeat: 0,
       styles: {
-        fontSize: 5,
-        cellPadding: 2,
-        overflow: 'linebreak'
+        fontSize: 7,
+        cellPadding: 4,
+        overflow: 'linebreak',
+        minCellWidth: 58
       },
       headStyles: {
         fillColor: [30, 41, 59],
         textColor: [255, 255, 255]
       },
       margin: {
-        top: 20,
-        left: 10,
-        right: 10,
-        bottom: 54
+        top,
+        left: 24,
+        right: 24,
+        bottom: 68
       },
       didDrawPage: () => {
-        const pageHeight = doc.internal.pageSize.getHeight();
-        doc.setDrawColor(203, 213, 225);
-        doc.line(24, pageHeight - 44, doc.internal.pageSize.getWidth() - 24, pageHeight - 44);
+        doc.setTextColor(30, 41, 59);
+        doc.setFontSize(13);
+        doc.text(heading, 24, 23);
         doc.setTextColor(71, 85, 105);
         doc.setFontSize(7);
-        metadata.forEach((line, index) => {
-          doc.setFont(undefined, index === 2 ? 'italic' : 'normal');
-          doc.text(line, 28, pageHeight - 31 + index * 10);
-        });
+        getExportMetadata().forEach((line, index) => doc.text(doc.splitTextToSize(line, width - 48), 24, height - 45 + index * 11));
       }
     });
     doc.save(`${sanitizeFilename(filename)}.pdf`);
   },
-  toPNG: (canvas, filename, title) => {
-    if (!canvas) {
-      alert('Gráfico não encontrado para exportação.');
-      return;
-    }
-    const scale = Math.max(1, canvas.width / Math.max(canvas.clientWidth || canvas.width, 1));
-    const padding = Math.round(24 * scale);
-    const headerHeight = Math.round(54 * scale);
-    const footerHeight = Math.round(82 * scale);
-    const output = document.createElement('canvas');
-    output.width = canvas.width + padding * 2;
-    output.height = canvas.height + headerHeight + footerHeight;
-    const context = output.getContext('2d');
-    context.fillStyle = '#ffffff';
-    context.fillRect(0, 0, output.width, output.height);
-    context.fillStyle = '#1e293b';
-    context.font = `800 ${Math.round(14 * scale)}px Outfit, Arial, sans-serif`;
-    context.fillText(String(title || 'Gráfico').toUpperCase(), padding, Math.round(32 * scale));
-    context.drawImage(canvas, padding, headerHeight);
-    const footerTop = headerHeight + canvas.height + Math.round(12 * scale);
-    context.strokeStyle = '#cbd5e1';
-    context.lineWidth = Math.max(1, scale);
-    context.beginPath();
-    context.moveTo(padding, footerTop);
-    context.lineTo(output.width - padding, footerTop);
-    context.stroke();
-    getExportMetadata().forEach((line, index) => {
-      context.fillStyle = '#475569';
-      context.font = `${index === 2 ? 'italic ' : ''}700 ${Math.round(10 * scale)}px Outfit, Arial, sans-serif`;
-      context.fillText(line, padding, footerTop + Math.round((19 + index * 17) * scale));
-    });
-    const link = document.createElement('a');
-    link.download = `${sanitizeFilename(filename)}.png`;
-    link.href = output.toDataURL('image/png');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }
+  toPNG: ExportData.png
 };
 const exportMasterColumns = [{
   header: "CONTRATO",
@@ -1022,11 +1738,11 @@ const getFullTooltipContrato = dataArray => ({
         if (context.dataset.label === '% Tempo') {
           const dias = item.encerrando_dias !== null ? `${item.encerrando_dias} d` : '-';
           label += ` (Faltam: ${dias})`;
-        } else if (context.dataset.label === '% Execução') {
-          label += ` (${formatBRL(item.v_executado)})`;
+        } else if (context.dataset.label === '% Recebido') {
+          label += ` (${formatBRL(item.v_recebido)})`;
         } else if (context.dataset.label === '% Liquidado') {
           label += ` (${formatBRL(item.v_liquidado)})`;
-        } else if (context.dataset.label === '% Exec. Líquida') {
+        } else if (context.dataset.label === '% Pago') {
           label += ` (${formatBRL(item.v_pago)})`;
         }
       } else {
@@ -1079,11 +1795,11 @@ const startResize = e => {
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mouseup', onMouseUp);
 };
-function AutoFitText(_ref2) {
+function AutoFitText(_ref14) {
   let {
     text,
     className
-  } = _ref2;
+  } = _ref14;
   const containerRef = useRef(null);
   const textRef = useRef(null);
   useEffect(() => {
@@ -1111,22 +1827,25 @@ function AutoFitText(_ref2) {
     className: `${className} origin-left whitespace-nowrap inline-block`
   }, text));
 }
-const ChartComponent = _ref3 => {
+const ChartComponent = _ref15 => {
   let {
     type,
     data,
     options,
     id,
-    exportTitle
-  } = _ref3;
+    exportTitle,
+    exportRows,
+    exportColumns,
+    exportPercentUnit,
+    hideExportActions = false
+  } = _ref15;
   const coloredData = useMemo(() => MetricColors.chartData(data, type), [data, type]);
-  const canvasRef = useRef(null);
-  const chartInstance = useRef(null);
+  const canvasRef = useRef(null),
+    chartInstance = useRef(null);
   useEffect(() => {
     if (!canvasRef.current) return;
     if (chartInstance.current) chartInstance.current.destroy();
-    const ctx = canvasRef.current.getContext('2d');
-    chartInstance.current = new Chart(ctx, {
+    chartInstance.current = new Chart(canvasRef.current.getContext('2d'), {
       type,
       data: coloredData,
       options
@@ -1135,141 +1854,47 @@ const ChartComponent = _ref3 => {
       if (chartInstance.current) chartInstance.current.destroy();
     };
   }, [coloredData, options, type]);
-  const handlePngExport = () => {
-    var _canvas$closest;
-    const canvas = canvasRef.current;
-    const nearbyTitle = canvas === null || canvas === void 0 || (_canvas$closest = canvas.closest('.bg-white')) === null || _canvas$closest === void 0 || (_canvas$closest = _canvas$closest.querySelector('h3')) === null || _canvas$closest === void 0 || (_canvas$closest = _canvas$closest.textContent) === null || _canvas$closest === void 0 ? void 0 : _canvas$closest.trim();
-    const title = exportTitle || nearbyTitle || id || 'Gráfico';
-    exportTable.toPNG(canvas, title, title);
+  const title = () => {
+    var _canvasRef$current;
+    return exportTitle || ((_canvasRef$current = canvasRef.current) === null || _canvasRef$current === void 0 || (_canvasRef$current = _canvasRef$current.closest('.bg-white')) === null || _canvasRef$current === void 0 || (_canvasRef$current = _canvasRef$current.querySelector('h3')) === null || _canvasRef$current === void 0 || (_canvasRef$current = _canvasRef$current.textContent) === null || _canvasRef$current === void 0 ? void 0 : _canvasRef$current.trim()) || id || 'Gráfico';
   };
-  const getChartTableExport = () => {
-    var _datasets$;
-    const datasets = (data === null || data === void 0 ? void 0 : data.datasets) || [];
-    const firstRaw = (_datasets$ = datasets[0]) === null || _datasets$ === void 0 || (_datasets$ = _datasets$.data) === null || _datasets$ === void 0 ? void 0 : _datasets$[0];
-    if (firstRaw && typeof firstRaw === 'object' && !Array.isArray(firstRaw)) {
-      const rows = datasets.flatMap(dataset => (dataset.data || []).map(point => ({
-        contrato: point.contrato || '-',
-        situacao: point.situacao || '-',
-        fornecedor: point.fornecedor || '-',
-        empenhado: point.v_empenhado || 0,
-        recebido: point.v_recebido || 0,
-        liquidado: point.v_liquidado || 0,
-        pago: point.v_pago || 0,
-        eixo_x: point.x ?? 0,
-        eixo_y: point.y ?? 0
-      })));
-      return {
-        rows,
-        columns: [{
-          header: 'CONTRATO',
-          key: 'contrato'
-        }, {
-          header: 'SITUAÇÃO',
-          key: 'situacao'
-        }, {
-          header: 'FORNECEDOR',
-          key: 'fornecedor'
-        }, {
-          header: 'EMPENHADO',
-          key: 'empenhado',
-          isCurrency: true
-        }, {
-          header: 'RECEBIDO',
-          key: 'recebido',
-          isCurrency: true
-        }, {
-          header: 'LIQUIDADO',
-          key: 'liquidado',
-          isCurrency: true
-        }, {
-          header: 'PAGO',
-          key: 'pago',
-          isCurrency: true
-        }, {
-          header: 'EIXO X (%)',
-          key: 'eixo_x',
-          format: row => `${Number(row.eixo_x || 0).toLocaleString('pt-BR', {
-            maximumFractionDigits: 2
-          })}%`
-        }, {
-          header: 'EIXO Y (%)',
-          key: 'eixo_y',
-          format: row => `${Number(row.eixo_y || 0).toLocaleString('pt-BR', {
-            maximumFractionDigits: 2
-          })}%`
-        }]
-      };
-    }
-    const rows = ((data === null || data === void 0 ? void 0 : data.labels) || []).map((label, index) => {
-      const row = {
-        subject: Array.isArray(label) ? label.join(' ') : label
-      };
-      datasets.forEach((dataset, datasetIndex) => {
-        var _dataset$data;
-        row[`dataset_${datasetIndex}`] = ((_dataset$data = dataset.data) === null || _dataset$data === void 0 ? void 0 : _dataset$data[index]) ?? 0;
-      });
-      return row;
-    });
-    const columns = [{
-      header: 'ASSUNTO',
-      key: 'subject'
-    }, ...datasets.map((dataset, datasetIndex) => {
-      const label = dataset.label || `SÉRIE ${datasetIndex + 1}`;
-      const isPercent = label.includes('%');
-      const isCurrency = !isPercent && !/QTD|QUANT|CONTRATOS|INICIADOS|ENCERRADOS|DURANTE/i.test(label) && /EMPENH|RECEB|LIQUID|PAGO|BLOQ|CANCEL|A LIQUIDAR|A PAGAR|VALOR|GLOBAL|EXECUTADO/i.test(label);
-      return {
-        header: label.toUpperCase(),
-        key: `dataset_${datasetIndex}`,
-        isCurrency,
-        format: isPercent ? row => {
-          const value = Number(row[`dataset_${datasetIndex}`] || 0);
-          return Math.abs(value) > 1 ? `${value.toLocaleString('pt-BR', {
-            maximumFractionDigits: 2
-          })}%` : formatPercentBR(value);
-        } : undefined
-      };
-    })];
-    return {
-      rows,
-      columns
-    };
-  };
-  const handleChartTableExport = format => {
-    var _canvas$closest2;
-    const canvas = canvasRef.current;
-    const nearbyTitle = canvas === null || canvas === void 0 || (_canvas$closest2 = canvas.closest('.bg-white')) === null || _canvas$closest2 === void 0 || (_canvas$closest2 = _canvas$closest2.querySelector('h3')) === null || _canvas$closest2 === void 0 || (_canvas$closest2 = _canvas$closest2.textContent) === null || _canvas$closest2 === void 0 ? void 0 : _canvas$closest2.trim();
-    const title = exportTitle || nearbyTitle || id || 'Gráfico';
-    const {
-      rows,
-      columns
-    } = getChartTableExport();
-    if (format === 'excel') exportTable.toExcel(rows, title, columns);else if (format === 'csv') exportTable.toCSV(rows, title, columns);else exportTable.toPDF(rows, title, columns, title);
+  const handlePngExport = () => exportTable.toPNG(canvasRef.current, title(), title(), {
+    type,
+    data: coloredData,
+    options
+  }, chartInstance.current);
+  const handleTableExport = format => {
+    const result = exportRows && exportColumns ? {
+      rows: exportRows,
+      columns: exportColumns
+    } : ExportData.chartRows(data, type, chartInstance.current, exportPercentUnit, id);
+    if (format === 'excel') exportTable.toExcel(result.rows, title(), result.columns);else if (format === 'csv') exportTable.toCSV(result.rows, title(), result.columns);else exportTable.toPDF(result.rows, title(), result.columns, title());
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "chart-export-host relative w-full h-full"
-  }, /*#__PURE__*/React.createElement("div", {
+  }, !hideExportActions && /*#__PURE__*/React.createElement("div", {
     className: "chart-export-actions absolute right-1 top-1 z-20 flex gap-1",
     "aria-label": "Exportar gr\xE1fico e dados"
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: handlePngExport,
     className: "rounded bg-slate-800/90 px-2 py-1 text-[8px] font-black text-white shadow hover:bg-slate-700",
-    title: "Exportar a visualiza\xE7\xE3o atual em PNG"
+    title: "Exportar gr\xE1fico completo em PNG"
   }, "PNG"), /*#__PURE__*/React.createElement("button", {
     type: "button",
-    onClick: () => handleChartTableExport('excel'),
+    onClick: () => handleTableExport('excel'),
     className: "rounded bg-green-600/90 px-2 py-1 text-[8px] font-black text-white shadow hover:bg-green-500",
-    title: "Exportar dados para Excel"
+    title: "Exportar todos os dados exibidos para Excel"
   }, "EXCEL"), /*#__PURE__*/React.createElement("button", {
     type: "button",
-    onClick: () => handleChartTableExport('csv'),
+    onClick: () => handleTableExport('csv'),
     className: "rounded bg-blue-600/90 px-2 py-1 text-[8px] font-black text-white shadow hover:bg-blue-500",
-    title: "Exportar dados para CSV"
+    title: "Exportar todos os dados exibidos para CSV"
   }, "CSV"), /*#__PURE__*/React.createElement("button", {
     type: "button",
-    onClick: () => handleChartTableExport('pdf'),
+    onClick: () => handleTableExport('pdf'),
     className: "rounded bg-red-600/90 px-2 py-1 text-[8px] font-black text-white shadow hover:bg-red-500",
-    title: "Exportar dados para PDF"
+    title: "Exportar todos os dados exibidos para PDF"
   }, "PDF")), /*#__PURE__*/React.createElement("canvas", {
     id: id,
     ref: canvasRef
@@ -1277,7 +1902,7 @@ const ChartComponent = _ref3 => {
 };
 
 // Componente: alterna entre Pizza, Barras e Tabela com seletor financeiro.
-function ToggleableChartCard(_ref4) {
+function ToggleableChartCard(_ref16) {
   var _title$match;
   let {
     title,
@@ -1286,7 +1911,7 @@ function ToggleableChartCard(_ref4) {
     id,
     isFornecedor,
     subjectLabel: subjectLabelProp
-  } = _ref4;
+  } = _ref16;
   const [viewMode, setViewMode] = useState('pie');
   const [finMetric, setFinMetric] = useState('total');
   const [tableSort, setTableSort] = useState({
@@ -1742,18 +2367,18 @@ function ToggleableChartCard(_ref4) {
     exportTitle: displayTitle
   }))));
 }
-function ChartTableToggle(_ref5) {
+function ChartTableToggle(_ref17) {
   let {
     isTable,
     onToggle
-  } = _ref5;
+  } = _ref17;
   return /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: onToggle,
     className: "rounded border border-blue-200 bg-blue-50 px-3 py-1.5 text-[9px] font-black uppercase tracking-widest text-blue-600 shadow-sm transition hover:bg-blue-100"
   }, isTable ? '▥ GRÁFICO' : '▦ TABELA');
 }
-function SortableChartTable(_ref6) {
+function SortableChartTable(_ref18) {
   var _columns$;
   let {
     id,
@@ -1761,7 +2386,7 @@ function SortableChartTable(_ref6) {
     rows,
     columns,
     initialSortKey
-  } = _ref6;
+  } = _ref18;
   const [sort, setSort] = useState({
     key: initialSortKey || ((_columns$ = columns[0]) === null || _columns$ === void 0 ? void 0 : _columns$.key),
     direction: 'desc'
@@ -1790,12 +2415,12 @@ function SortableChartTable(_ref6) {
     if (typeof value === 'number') return value.toLocaleString('pt-BR');
     return value;
   };
-  const exportColumns = columns.map(_ref7 => {
+  const exportColumns = columns.map(_ref19 => {
     let {
       render,
       sortValue,
       ...column
-    } = _ref7;
+    } = _ref19;
     return column;
   });
   return /*#__PURE__*/React.createElement("div", {
@@ -1839,7 +2464,7 @@ function SortableChartTable(_ref6) {
     title: columnIndex === 0 ? row._tooltip || String(row[column.key] || '') : undefined
   }, displayValue(row, column)))))))));
 }
-function KPICard(_ref8) {
+function KPICard(_ref20) {
   let {
     title,
     value,
@@ -1850,7 +2475,7 @@ function KPICard(_ref8) {
     color,
     isCurrency,
     subLabel = "do Empenhado"
-  } = _ref8;
+  } = _ref20;
   const colors = {
     slate: "border-slate-800 text-slate-800",
     blue: "border-blue-500 text-blue-700",
@@ -1891,7 +2516,7 @@ function KPICard(_ref8) {
     className: "text-[10px] font-bold opacity-70 mt-1"
   }, formatPercentBR(subValue), " ", subLabel), renderExtraText()));
 }
-function TextHeader(_ref9) {
+function TextHeader(_ref21) {
   let {
     label,
     field,
@@ -1901,7 +2526,7 @@ function TextHeader(_ref9) {
     searchVal,
     onSearchChange,
     widthClass
-  } = _ref9;
+  } = _ref21;
   const isSorted = current.key === field;
   return /*#__PURE__*/React.createElement("th", {
     className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -1922,7 +2547,7 @@ function TextHeader(_ref9) {
     className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   }));
 }
-function NumericHeader(_ref10) {
+function NumericHeader(_ref22) {
   let {
     label,
     field,
@@ -1932,7 +2557,7 @@ function NumericHeader(_ref10) {
     setNumFilters,
     align = "left",
     widthClass
-  } = _ref10;
+  } = _ref22;
   const isSorted = current.key === field;
   const filterMin = numFilters[field] ? numFilters[field].min : '';
   const filterMax = numFilters[field] ? numFilters[field].max : '';
@@ -1991,7 +2616,7 @@ function NumericHeader(_ref10) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function DateFilterHeader(_ref11) {
+function DateFilterHeader(_ref23) {
   let {
     label,
     field,
@@ -2001,7 +2626,7 @@ function DateFilterHeader(_ref11) {
     setDateFilters,
     align = "left",
     widthClass
-  } = _ref11;
+  } = _ref23;
   const isSorted = current.key === field;
   const filterMin = dateFilters[field] ? dateFilters[field].min : '';
   const filterMax = dateFilters[field] ? dateFilters[field].max : '';
@@ -2052,13 +2677,13 @@ function DateFilterHeader(_ref11) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function MultiSelect(_ref12) {
+function MultiSelect(_ref24) {
   let {
     label,
     options,
     selected,
     onChange
-  } = _ref12;
+  } = _ref24;
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef();
@@ -2124,12 +2749,12 @@ function MultiSelect(_ref12) {
     title: o
   }, o))))));
 }
-function DateInput(_ref13) {
+function DateInput(_ref25) {
   let {
     label,
     value,
     onChange
-  } = _ref13;
+  } = _ref25;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
   }, label), /*#__PURE__*/React.createElement("input", {
@@ -2194,14 +2819,14 @@ function AccessMetadata() {
     className: "italic"
   }, "Produzido por Cel Brito"));
 }
-function CollapsibleSection(_ref14) {
+function CollapsibleSection(_ref26) {
   let {
     title,
     children,
     defaultOpen = false,
     globalTrigger,
     globalState
-  } = _ref14;
+  } = _ref26;
   const [isOpen, setIsOpen] = useState(defaultOpen);
   useEffect(() => {
     if (globalTrigger > 0) setIsOpen(globalState);
@@ -2223,31 +2848,31 @@ function CollapsibleSection(_ref14) {
 }
 const DocumentModule = ((sharedExports, sharedChart) => {
   const tagColorsMap = {
-    'ATIVO INEXEC': {
+    'VIG SEM EXEC': {
       css: 'bg-purple-700 text-white',
       hex: '#7e22ce'
     },
-    'ATIVO EM EXEC': {
+    'VIG EM EXEC': {
       css: 'bg-cyan-500 text-slate-900',
       hex: '#06b6d4'
     },
-    'ATIVO EXEC TOT': {
+    'VIG EXEC TOTAL': {
       css: 'bg-blue-800 text-white',
       hex: '#1e40af'
     },
-    'ATIVO EXEC PARC': {
+    'VIG EXEC PARCIAL': {
       css: 'bg-sky-400 text-slate-900',
       hex: '#38bdf8'
     },
-    'VENC INEXEC TOT': {
+    'VENC INEXEC TOTAL': {
       css: 'bg-rose-900 text-white',
       hex: '#881337'
     },
-    'VENC EXEC TOT': {
+    'VENC EXEC TOTAL': {
       css: 'bg-green-600 text-white',
       hex: '#16a34a'
     },
-    'VENC EXEC PARC': {
+    'VENC EXEC PARCIAL': {
       css: 'bg-yellow-500 text-slate-900',
       hex: '#eab308'
     },
@@ -2332,20 +2957,20 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     document.addEventListener('mouseup', onMouseUp);
   };
   const exportTable = sharedExports;
-  const FormatNegativeValue = _ref15 => {
+  const FormatNegativeValue = _ref27 => {
     let {
       val
-    } = _ref15;
+    } = _ref27;
     if (val === null || val === undefined) return /*#__PURE__*/React.createElement("span", null, "-");
     const isNegative = val < -0.001;
     return /*#__PURE__*/React.createElement("span", {
       className: isNegative ? "underline decoration-red-500 decoration-[2px] underline-offset-2" : ""
     }, formatBRL(val));
   };
-  const ContratoCell = _ref16 => {
+  const ContratoCell = _ref28 => {
     let {
       row
-    } = _ref16;
+    } = _ref28;
     return /*#__PURE__*/React.createElement("div", {
       className: "flex flex-col"
     }, /*#__PURE__*/React.createElement("span", {
@@ -2356,14 +2981,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "text-[8px] text-slate-500 leading-tight whitespace-normal break-words"
     }, "Mod: ", row.modalidade));
   };
-  function CollapsibleSection(_ref17) {
+  function CollapsibleSection(_ref29) {
     let {
       title,
       children,
       defaultOpen = false,
       globalTrigger,
       globalState
-    } = _ref17;
+    } = _ref29;
     const [isOpen, setIsOpen] = useState(defaultOpen);
     useEffect(() => {
       if (globalTrigger > 0) setIsOpen(globalState);
@@ -2383,11 +3008,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-6"
     }, children));
   }
-  function AutoFitText(_ref18) {
+  function AutoFitText(_ref30) {
     let {
       text,
       className
-    } = _ref18;
+    } = _ref30;
     const containerRef = useRef(null);
     const textRef = useRef(null);
     useEffect(() => {
@@ -2415,38 +3040,209 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     }, text));
   }
   const ChartComponent = sharedChart;
-  function FunnelChart(_ref19) {
+  function DocumentComposition(_ref31) {
     let {
-      data
-    } = _ref19;
-    const max = data.length > 0 && data[0].value > 0 ? data[0].value : 1;
-    return /*#__PURE__*/React.createElement("div", {
-      className: "w-full h-full flex flex-col-reverse items-center justify-center gap-2 py-2"
-    }, data.map((item, i) => {
-      var _MetricColors$get;
-      const pct = data[0].value > 0 ? item.value / max * 100 : 0;
-      const w = Math.max(pct, 15);
-      return /*#__PURE__*/React.createElement("div", {
-        key: i,
-        className: "w-full flex flex-col items-center justify-center flex-1"
-      }, /*#__PURE__*/React.createElement("span", {
-        className: "text-[9px] font-black text-slate-500 uppercase mb-1",
-        style: MetricColors.textStyle(item.label)
-      }, item.label), /*#__PURE__*/React.createElement("div", {
-        className: `${item.color} rounded shadow-sm transition-all duration-500 flex items-center justify-center relative hover:opacity-80 cursor-help`,
-        "data-metric": MetricColors.key(item.label),
-        style: {
-          width: `${w}%`,
-          minHeight: '28px',
-          backgroundColor: (_MetricColors$get = MetricColors.get(item.label)) === null || _MetricColors$get === void 0 ? void 0 : _MetricColors$get.color
-        },
-        title: `${item.label}: ${formatBRL(item.value)}`
-      }, /*#__PURE__*/React.createElement("span", {
-        className: "text-white font-black text-[10px] drop-shadow-md px-2 text-center whitespace-nowrap"
-      }, shortenNumber(item.value), " (", pct.toFixed(1).replace('.', ','), "%)")));
+      counts,
+      amounts,
+      uniqueDocs
+    } = _ref31;
+    const canvasRef = useRef(null);
+    const rows = useMemo(() => {
+      const stages = [{
+        stage: 'EMPENHADO',
+        key: 'empenhado',
+        amount: 'emp',
+        color: '#3b82f6'
+      }, {
+        stage: 'RECEBIDO',
+        key: 'recebido',
+        amount: 'rec',
+        color: '#8b5cf6'
+      }, {
+        stage: 'LIQUIDADO',
+        key: 'liquidado',
+        amount: 'liq',
+        color: '#f59e0b'
+      }, {
+        stage: 'PAGO',
+        key: 'pago',
+        amount: 'pag',
+        color: '#10b981'
+      }];
+      const totalCounts = stages.reduce((sum, stage) => sum + (counts[stage.key] || 0), 0);
+      return stages.map(stage => {
+        var _MetricColors$get;
+        return {
+          stage: stage.stage,
+          color: ((_MetricColors$get = MetricColors.get(stage.key)) === null || _MetricColors$get === void 0 ? void 0 : _MetricColors$get.color) || stage.color,
+          count: counts[stage.key] || 0,
+          countShare: totalCounts ? (counts[stage.key] || 0) / totalCounts : 0,
+          value: amounts[stage.amount] || 0,
+          valueShare: amounts.emp ? (amounts[stage.amount] || 0) / amounts.emp : 0
+        };
+      });
+    }, [counts, amounts]);
+    const columns = [{
+      header: 'ESTÁGIO',
+      key: 'stage'
+    }, {
+      header: 'QTD DE DOCUMENTOS',
+      key: 'count'
+    }, {
+      header: '% DAS PARTICIPAÇÕES POR ESTÁGIO',
+      key: 'countShare',
+      isPercent: true
+    }, {
+      header: 'VOLUME FINANCEIRO',
+      key: 'value',
+      isCurrency: true
+    }, {
+      header: '% DO EMPENHADO',
+      key: 'valueShare',
+      isPercent: true
+    }, {
+      header: 'TOTAL DE DOCUMENTOS ÚNICOS NO RECORTE',
+      key: 'uniqueDocs'
+    }];
+    const exportRows = rows.map(row => ({
+      ...row,
+      uniqueDocs
     }));
+    useEffect(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      canvas.width = 1100;
+      canvas.height = 1120;
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#334155';
+      ctx.font = '800 28px Outfit, Arial, sans-serif';
+      ctx.fillText('QTD DE DOCUMENTOS ÚNICOS', 550, 36);
+      const totalCount = rows.reduce((sum, row) => sum + row.count, 0),
+        cx = 550,
+        cy = 235,
+        radius = 155,
+        inner = 92;
+      let angle = -Math.PI / 2;
+      if (!totalCount) {
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.lineWidth = radius - inner;
+        ctx.beginPath();
+        ctx.arc(cx, cy, (radius + inner) / 2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      rows.forEach((row, index) => {
+        if (row.count <= 0 || totalCount <= 0) return;
+        const end = angle + row.countShare * Math.PI * 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, angle, end);
+        ctx.arc(cx, cy, inner, end, angle, true);
+        ctx.closePath();
+        ctx.fillStyle = row.color;
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        angle = end;
+      });
+      ctx.fillStyle = '#1e293b';
+      ctx.font = '900 52px Outfit, Arial, sans-serif';
+      ctx.fillText(Number(uniqueDocs || 0).toLocaleString('pt-BR'), cx, cy - 8);
+      ctx.font = '700 19px Outfit, Arial, sans-serif';
+      ctx.fillText('TOTAL DOCS', cx, cy + 36);
+      rows.forEach((row, index) => {
+        const x = index % 2 === 0 ? 35 : 660,
+          y = 420 + Math.floor(index / 2) * 54;
+        ctx.fillStyle = row.color;
+        ctx.fillRect(x, y - 10, 20, 20);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#334155';
+        ctx.font = '800 20px Outfit, Arial, sans-serif';
+        ctx.fillText(`${row.stage}: ${row.count.toLocaleString('pt-BR')} (${formatPercentBR(row.countShare)})`, x + 30, y, 405);
+      });
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#334155';
+      ctx.font = '800 28px Outfit, Arial, sans-serif';
+      ctx.fillText('VOLUME FINANCEIRO TOTAL (R$)', 550, 555);
+      const maxValue = Math.max(1, ...rows.map(row => Math.max(0, row.value))),
+        widthAt = value => Math.max(0, value) / maxValue * 670;
+      rows.forEach((row, index) => {
+        const y = 610 + index * 112,
+          topWidth = widthAt(row.value);
+        const nextWidth = index < rows.length - 1 ? widthAt(rows[index + 1].value) : Math.max(topWidth * 0.65, 0);
+        const center = 590,
+          bottomY = y + 96,
+          left = center - topWidth / 2,
+          right = center + topWidth / 2;
+        ctx.beginPath();
+        ctx.moveTo(left, y);
+        ctx.lineTo(right, y);
+        ctx.lineTo(center + nextWidth / 2, bottomY);
+        ctx.lineTo(center - nextWidth / 2, bottomY);
+        ctx.closePath();
+        ctx.fillStyle = row.color;
+        ctx.fill();
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#334155';
+        ctx.font = '800 20px Outfit, Arial, sans-serif';
+        ctx.fillText(row.stage, 25, y + 48);
+        ctx.strokeStyle = row.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(180, y + 48);
+        ctx.lineTo(Math.max(190, center - (topWidth + nextWidth) / 4), y + 48);
+        ctx.stroke();
+        const financialText = formatBRL(row.value),
+          percentageText = `${formatPercentBR(row.valueShare)} do empenhado`;
+        ctx.font = '900 25px Outfit, Arial, sans-serif';
+        const fitsInside = Math.min(topWidth, nextWidth) >= Math.max(ctx.measureText(financialText).width + 24, 260);
+        ctx.textAlign = fitsInside ? 'center' : 'right';
+        ctx.fillStyle = fitsInside ? '#000' : '#334155';
+        const valueX = fitsInside ? center : 1075;
+        ctx.fillText(financialText, valueX, y + 36);
+        ctx.font = '700 19px Outfit, Arial, sans-serif';
+        ctx.fillText(percentageText, valueX, y + 66);
+      });
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#64748b';
+      ctx.font = '600 18px Outfit, Arial, sans-serif';
+      ctx.fillText('Um documento pode participar de mais de um estágio.', 550, 1090);
+    }, [rows, uniqueDocs]);
+    const name = 'Composicao_de_Documentos';
+    return /*#__PURE__*/React.createElement("div", {
+      className: "flex flex-col gap-3"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex flex-wrap justify-end gap-1",
+      "aria-label": "Exportar composi\xE7\xE3o completa dos documentos"
+    }, /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => exportTable.toPNG(canvasRef.current, name, 'COMPOSIÇÃO DE DOCUMENTOS — QUANTIDADES E VALORES'),
+      className: "rounded bg-slate-700 px-2 py-1 text-[9px] font-black text-white"
+    }, "PNG"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => exportTable.toExcel(exportRows, name, columns),
+      className: "rounded bg-green-600 px-2 py-1 text-[9px] font-black text-white"
+    }, "EXCEL"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => exportTable.toCSV(exportRows, name, columns),
+      className: "rounded bg-blue-600 px-2 py-1 text-[9px] font-black text-white"
+    }, "CSV"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => exportTable.toPDF(exportRows, name, columns, 'COMPOSIÇÃO DE DOCUMENTOS — QUANTIDADES E VALORES'),
+      className: "rounded bg-red-600 px-2 py-1 text-[9px] font-black text-white"
+    }, "PDF")), /*#__PURE__*/React.createElement("div", {
+      className: "overflow-x-auto"
+    }, /*#__PURE__*/React.createElement("canvas", {
+      ref: canvasRef,
+      className: "mx-auto block h-auto w-full min-w-[660px] max-w-[900px]",
+      "aria-label": rows.map(row => `${row.stage}: ${row.count} documentos, ${formatPercentBR(row.countShare)} das participações; ${formatBRL(row.value)}, ${formatPercentBR(row.valueShare)} do empenhado`).join('; '),
+      role: "img"
+    })));
   }
-  function LatestDocCard(_ref20) {
+  function LatestDocCard(_ref32) {
     var _MetricColors$get2;
     let {
       title,
@@ -2454,77 +3250,62 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       metricField,
       colorClass,
       showEmitente
-    } = _ref20;
-    const latestDateStr = docs && docs.length > 0 ? docs[0].dia : '';
-    const latestTimestamp = docs && docs.length > 0 ? docs[0].diaVal : null;
-    const totalValue = useMemo(() => docs.reduce((acc, curr) => acc + (curr[metricField] || 0), 0), [docs, metricField]);
+    } = _ref32;
+    const first = docs === null || docs === void 0 ? void 0 : docs[0];
+    const totalValue = useMemo(() => (docs || []).reduce((sum, doc) => sum + (doc[metricField] || 0), 0), [docs, metricField]);
     const daysText = useMemo(() => {
-      if (!latestTimestamp) return '';
+      if (!(first !== null && first !== void 0 && first.diaVal)) return '';
       const today = new Date();
       today.setHours(0, 0, 0, 0);
-      const docDate = new Date(latestTimestamp);
-      docDate.setHours(0, 0, 0, 0);
-      const diffDays = Math.floor((today - docDate) / 86400000);
-      return `(${diffDays} dia${diffDays === 1 ? '' : 's'})`;
-    }, [latestTimestamp]);
-    if (!docs || docs.length === 0) return /*#__PURE__*/React.createElement("div", {
-      className: "p-4 rounded-2xl border border-slate-200 bg-slate-50 opacity-60 flex flex-col justify-center h-full"
-    }, /*#__PURE__*/React.createElement("h4", {
-      className: "text-[10px] font-black uppercase tracking-widest opacity-50 mb-1",
-      style: MetricColors.textStyle(metricField)
-    }, title, " (0)"), /*#__PURE__*/React.createElement("p", {
-      className: "text-xs font-bold text-slate-400"
-    }, "Nenhum documento encontrado."));
+      const days = Math.floor((today.getTime() - first.diaVal) / 86400000);
+      return `${days} dia${days === 1 ? '' : 's'}`;
+    }, [first === null || first === void 0 ? void 0 : first.diaVal]);
     return /*#__PURE__*/React.createElement("div", {
-      className: `p-4 rounded-2xl shadow-sm border border-t-4 bg-white flex flex-col h-full max-h-[300px] hover:shadow-md transition ${colorClass.split(' ')[0]}`,
+      className: `p-4 rounded-2xl shadow-sm border border-t-4 bg-white flex flex-col h-full max-h-[320px] min-w-0 ${colorClass.split(' ')[0]}`,
       "data-metric": MetricColors.key(metricField),
       style: {
         borderTopColor: (_MetricColors$get2 = MetricColors.get(metricField)) === null || _MetricColors$get2 === void 0 ? void 0 : _MetricColors$get2.color
       }
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "flex justify-between items-start mb-3 shrink-0 gap-2"
     }, /*#__PURE__*/React.createElement("h4", {
-      className: `text-[10px] font-black uppercase tracking-widest ${colorClass.split(' ')[1]}`,
+      className: `mb-3 text-[10px] font-black uppercase tracking-widest ${colorClass.split(' ')[1]}`,
       style: MetricColors.textStyle(metricField)
-    }, title, " (", docs.length, ")"), /*#__PURE__*/React.createElement("div", {
-      className: "text-[8.5px] font-black text-red-600 bg-red-50 px-1.5 py-0.5 rounded border border-red-200 text-right whitespace-nowrap"
-    }, "Data: ", latestDateStr, " ", daysText)), /*#__PURE__*/React.createElement("div", {
-      className: "flex flex-col gap-2 overflow-y-auto flex-1 pr-1 custom-scrollbar mb-2"
-    }, docs.map((doc, idx) => /*#__PURE__*/React.createElement("div", {
-      key: idx,
-      className: "flex justify-between items-center py-1.5 border-b border-slate-100 last:border-0 shrink-0"
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "flex flex-col w-2/3 pr-2"
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "flex items-center gap-1.5 flex-wrap"
+    }, title, " (", (docs === null || docs === void 0 ? void 0 : docs.length) || 0, ")"), !first ? /*#__PURE__*/React.createElement("p", {
+      className: "text-xs font-bold text-slate-400"
+    }, "Nenhum documento encontrado.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      className: "mb-3 grid grid-cols-[max-content_minmax(0,1fr)] items-center gap-2 border-b border-slate-100 pb-2 text-[9px] font-bold"
     }, /*#__PURE__*/React.createElement("span", {
-      className: "text-[10px] font-bold text-slate-400 whitespace-nowrap"
+      className: "whitespace-nowrap text-slate-500"
+    }, first.dia, " ", daysText && `(${daysText})`), /*#__PURE__*/React.createElement("span", {
+      className: `min-w-0 text-right ${colorClass.split(' ')[1]}`,
+      style: MetricColors.textStyle(metricField)
+    }, /*#__PURE__*/React.createElement(AutoFitText, {
+      text: formatBRL(totalValue),
+      className: "font-black text-[10px]"
+    }))), /*#__PURE__*/React.createElement("div", {
+      className: "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pr-1 custom-scrollbar"
+    }, docs.map((doc, index) => /*#__PURE__*/React.createElement("div", {
+      key: index,
+      className: "border-b border-slate-100 py-1.5 last:border-0"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "mb-1 grid grid-cols-[max-content_minmax(0,1fr)] items-center gap-2 text-[10px]"
+    }, /*#__PURE__*/React.createElement("time", {
+      className: "whitespace-nowrap font-bold text-slate-500"
     }, doc.dia), /*#__PURE__*/React.createElement("span", {
-      className: "text-[11px] font-black text-slate-700 truncate",
-      title: `Favorecido: ${doc.favorecido || "N/I"} | Objeto: ${doc.objeto || "-"}`
-    }, doc.documento, " ", /*#__PURE__*/React.createElement("span", {
-      className: "text-[9px] text-slate-400 font-bold ml-1"
-    }, "(", doc.contrato, ")"))), showEmitente && /*#__PURE__*/React.createElement("span", {
-      className: "text-[9px] font-bold text-slate-500 truncate mt-0.5",
-      title: doc.ug
-    }, doc.ug)), /*#__PURE__*/React.createElement("span", {
-      className: `text-[11px] font-black truncate w-1/3 text-right ${colorClass.split(' ')[1]}`,
-      style: MetricColors.textStyle(metricField),
-      title: formatBRL(doc[metricField])
-    }, /*#__PURE__*/React.createElement(FormatNegativeValue, {
-      val: doc[metricField]
-    }))))), /*#__PURE__*/React.createElement("div", {
-      className: `pt-2 border-t border-slate-200 flex justify-between items-center shrink-0 ${colorClass.split(' ')[1]}`,
+      className: `min-w-0 text-right ${colorClass.split(' ')[1]}`,
       style: MetricColors.textStyle(metricField)
-    }, /*#__PURE__*/React.createElement("span", {
-      className: "text-[9px] font-black uppercase"
-    }, "Total Movimentado:"), /*#__PURE__*/React.createElement("span", {
-      className: "text-[12px] font-black"
-    }, /*#__PURE__*/React.createElement(FormatNegativeValue, {
-      val: totalValue
-    }))));
+    }, /*#__PURE__*/React.createElement(AutoFitText, {
+      text: formatBRL(doc[metricField]),
+      className: `font-black text-[10px] ${doc[metricField] < -0.001 ? 'underline decoration-red-500 decoration-[2px] underline-offset-2' : ''}`
+    }))), /*#__PURE__*/React.createElement("div", {
+      className: "break-words text-[10px] font-bold text-slate-700",
+      title: `Favorecido: ${doc.favorecido || 'N/I'} | Objeto: ${doc.objeto || '-'}`
+    }, doc.documento, " ", /*#__PURE__*/React.createElement("span", {
+      className: "text-[9px] text-slate-400"
+    }, "(", doc.contrato, ")")), showEmitente && /*#__PURE__*/React.createElement("div", {
+      className: "break-words text-[9px] font-bold text-slate-500"
+    }, doc.ug))))));
   }
-  function TextHeader(_ref21) {
+  function TextHeader(_ref33) {
     let {
       label,
       field,
@@ -2534,7 +3315,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       searchVal,
       onSearchChange,
       widthClass
-    } = _ref21;
+    } = _ref33;
     const isSorted = current.key === field;
     return /*#__PURE__*/React.createElement("th", {
       className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -2555,7 +3336,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     }));
   }
-  function NumericHeader(_ref22) {
+  function NumericHeader(_ref34) {
     let {
       label,
       field,
@@ -2565,7 +3346,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setNumFilters,
       align = "left",
       widthClass
-    } = _ref22;
+    } = _ref34;
     const isSorted = current.key === field;
     const handleMin = e => setNumFilters(p => ({
       ...p,
@@ -2610,7 +3391,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function DateFilterHeader(_ref23) {
+  function DateFilterHeader(_ref35) {
     let {
       label,
       field,
@@ -2620,7 +3401,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setDateFilters,
       align = "left",
       widthClass
-    } = _ref23;
+    } = _ref35;
     const isSorted = current.key === field;
     const handleMin = e => setDateFilters(p => ({
       ...p,
@@ -2663,13 +3444,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function MultiSelect(_ref24) {
+  function MultiSelect(_ref36) {
     let {
       label,
       options,
       selected,
       onChange
-    } = _ref24;
+    } = _ref36;
     const [isOpen, setIsOpen] = useState(false);
     const [search, setSearch] = useState("");
     const ref = useRef();
@@ -2733,12 +3514,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "truncate leading-tight"
     }, o))))));
   }
-  function DateInput(_ref25) {
+  function DateInput(_ref37) {
     let {
       label,
       value,
       onChange
-    } = _ref25;
+    } = _ref37;
     return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
       className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
     }, label), /*#__PURE__*/React.createElement("input", {
@@ -2748,7 +3529,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-sm cursor-pointer"
     }));
   }
-  function KPICard(_ref26) {
+  function KPICard(_ref38) {
     let {
       title,
       value,
@@ -2758,7 +3539,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       color,
       isCurrency,
       extraText
-    } = _ref26;
+    } = _ref38;
     const colors = {
       slate: "border-slate-800 text-slate-800",
       blue: "border-blue-500 text-blue-700",
@@ -2792,13 +3573,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       key: idx
     }, line)))));
   }
-  function DocStatCard(_ref27) {
+  function DocStatCard(_ref39) {
     let {
       title,
       count,
       date,
       timestamp
-    } = _ref27;
+    } = _ref39;
     const daysText = useMemo(() => {
       if (!timestamp) return '';
       const today = new Date();
@@ -2823,7 +3604,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // COMPONENTE: SUBTABELA DETALHADA
   // =========================================================
-  function SubTable(_ref28) {
+  function SubTable(_ref40) {
     let {
       title,
       data,
@@ -2833,7 +3614,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       rowBgColor,
       textColor,
       showDiasAss = false
-    } = _ref28;
+    } = _ref40;
     const [limit, setLimit] = useState(100);
     const [sortConfig, setSortConfig] = useState({
       key: 'diaVal',
@@ -3366,7 +4147,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // DASHBOARD MASTER CONTÁBIL
   // =========================================================
-  function useDashboard(_ref29) {
+  function useDashboard(_ref41) {
     let {
       payload,
       shared,
@@ -3375,8 +4156,9 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       globalExpandState,
       expandTrigger,
       resetRevision
-    } = _ref29;
+    } = _ref41;
     const [rawData, setRawData] = useState([]);
+    const [processedPayload, setProcessedPayload] = useState(null);
     const [loading, setLoading] = useState(false);
     const [status, setStatus] = useState("Aguardando sincronização. Clique em SINCRONIZAR APIs para carregar os dados.");
     const [sortConfig, setSortConfig] = useState({
@@ -3754,6 +4536,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         nd_codigo_values: [],
         nd_nome_values: []
       });
+      const ledgerByContract = (payload === null || payload === void 0 ? void 0 : payload.ledgerIndex) || ContractRules.accountingBalances(contabilRows);
+      const canonicalContracts = new Map();
+      rawContracts.forEach(row => {
+        const id = UnifiedData.key(row.contrato);
+        if (!canonicalContracts.has(id)) canonicalContracts.set(id, row);
+      });
       const geralDict = {};
       if (geralRows && geralRows.length > 1) {
         const hGeral = geralRows[0];
@@ -3783,7 +4571,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           const row = geralRows[i];
           if (!row || !row.length) continue;
           const contrato = getVG(["Número Contrato", "numero_contrato"], ["contrato"], row).toUpperCase();
-          if (!contrato || contrato === "-") continue;
+          if (!contrato || contrato === "-" || geralDict[UnifiedData.key(contrato)]) continue;
           const v_empenhado_g = parseValue(getVG(["TOTAL EMPENHADO"], [], row));
           const v_global_g = parseValue(getVG(["VALOR GLOBAL", "TOTAL GLOBAL", "Valor Global do Contrato", "VALOR_GLOBAL", "Valor Global (R$)"], ["valor global", "total global", "global contrato"], row));
           const v_liquidado_g = parseValue(getVG(["TOTAL LIQUIDADO"], [], row));
@@ -3802,47 +4590,27 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             const totalDias = Math.ceil((dtFimParsed - dtInicParsed) / 86400000);
             percTempo = totalDias > 0 ? diasPassaram / totalDias : 0;
           }
-          let flags = [];
-          let sitText = "";
-          if (v_cancelado_g > 0) {
-            flags.push({
-              label: 'CAN',
-              color: tagColorsMap['CAN'].css,
-              hex: tagColorsMap['CAN'].hex
-            });
-            sitText += "CAN ";
-          }
-          if (v_bloqueado_g > 0) {
-            flags.push({
-              label: 'BLOQ',
-              color: tagColorsMap['BLOQ'].css,
-              hex: tagColorsMap['BLOQ'].hex
-            });
-            sitText += "BLOQ ";
-          }
-          if (diasRestantes !== null) {
-            const isAtivo = diasRestantes >= 0;
-            const isLiquidadoZero = v_liquidado_g <= 0.01;
-            const isPagoZero = v_pago_g <= 0.01;
-            const isPagoIgualEmpenhado = v_pago_g >= v_empenhado_g - 0.01 && v_empenhado_g > 0;
-            const isExecutadoIgualEmpenhado = v_executado_g >= v_empenhado_g - 0.01 && v_empenhado_g > 0;
-            const isPagoMenorEmpenhado = v_pago_g < v_empenhado_g - 0.01;
-            const isExecutadoMenorEmpenhado = v_executado_g < v_empenhado_g - 0.01;
-            let tagKey = null;
-            if (isAtivo) {
-              if (isLiquidadoZero) tagKey = 'ATIVO INEXEC';else if (isExecutadoMenorEmpenhado) tagKey = 'ATIVO EM EXEC';else if (isPagoIgualEmpenhado) tagKey = 'ATIVO EXEC TOT';else if (isPagoMenorEmpenhado && isExecutadoIgualEmpenhado) tagKey = 'ATIVO EXEC PARC';
-            } else {
-              if (isPagoZero) tagKey = 'VENC INEXEC TOT';else if (isPagoIgualEmpenhado) tagKey = 'VENC EXEC TOT';else if (isPagoMenorEmpenhado && isExecutadoIgualEmpenhado) tagKey = 'VENC EXEC PARC';
-            }
-            if (tagKey) {
-              flags.push({
-                label: tagKey,
-                color: tagColorsMap[tagKey].css,
-                hex: tagColorsMap[tagKey].hex
-              });
-              sitText += `${tagKey} `;
-            }
-          }
+          const received = ledgerByContract.get(UnifiedData.key(contrato));
+          const canonicalContract = canonicalContracts.get(UnifiedData.key(contrato));
+          const classification = canonicalContract ? {
+            labels: canonicalContract.situacaoFlags.map(flag => flag.label)
+          } : ContractRules.classify({
+            v_empenhado: v_empenhado_g,
+            v_recebido: (received === null || received === void 0 ? void 0 : received.v_recebido) || 0,
+            v_liquidado: v_liquidado_g,
+            v_pago: v_pago_g,
+            v_cancelado: v_cancelado_g,
+            v_bloqueado: v_bloqueado_g
+          }, {
+            dtInicVal: dtInicParsed === null || dtInicParsed === void 0 ? void 0 : dtInicParsed.getTime(),
+            dtFimVal: dtFimParsed === null || dtFimParsed === void 0 ? void 0 : dtFimParsed.getTime()
+          }, received === null || received === void 0 ? void 0 : received.hasMovement, hoje);
+          const flags = classification.labels.map(label => ({
+            label,
+            color: tagColorsMap[label].css,
+            hex: tagColorsMap[label].hex
+          }));
+          const sitText = classification.labels.join(' ');
           geralDict[UnifiedData.key(contrato)] = {
             contrato,
             fornecedor: getVG(["Fornecedor"], [], row).toUpperCase() || "N/I",
@@ -3861,6 +4629,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             dias_passaram: diasPassaram,
             perc_tempo: percTempo,
             encerrando_dias: diasRestantes,
+            contract_metadata: canonicalContract === null || canonicalContract === void 0 ? void 0 : canonicalContract.contract_metadata,
+            contract_metadata_conflicts: (canonicalContract === null || canonicalContract === void 0 ? void 0 : canonicalContract.contract_metadata_conflicts) || [],
             situacaoFlags: flags,
             situacao: sitText.trim() || 'N/I',
             v_global: v_global_g
@@ -3947,6 +4717,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             modalidade: metadadosContrato ? metadadosContrato.modalidade : 'N/I',
             compra: metadadosContrato ? metadadosContrato.compra : 'N/I',
             v_global: metadadosContrato ? metadadosContrato.v_global : 0,
+            contract_metadata: metadadosContrato === null || metadadosContrato === void 0 ? void 0 : metadadosContrato.contract_metadata,
             situacaoFlags: metadadosContrato ? metadadosContrato.situacaoFlags : [],
             situacao: metadadosContrato ? metadadosContrato.situacao : 'N/I',
             existencia: metadadosContrato ? 'AMBAS' : 'CONTÁBIL',
@@ -4017,6 +4788,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             modalidade: meta.modalidade,
             compra: meta.compra,
             objeto: meta.objeto,
+            contract_metadata: meta.contract_metadata,
             situacaoFlags: meta.situacaoFlags,
             situacao: meta.situacao,
             existencia: 'GERAL',
@@ -4105,8 +4877,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setLoading(false);
     };
     useEffect(() => {
-      if (payload) processMergedData(payload.contabil || [], payload.geral || [], payload.orcamentario || []);
-    }, [payload]);
+      if (payload) {
+        processMergedData(payload.contabil || [], payload.geral || [], payload.orcamentario || []);
+        setProcessedPayload(payload);
+      }
+    }, [payload, rawContracts]);
     const contractMap = useMemo(() => new Map(rawContracts.map(row => [UnifiedData.key(row.contrato), row])), [rawContracts]);
     const budgetIndex = useMemo(() => UnifiedData.budgetIndex(payload ? payload.orcamentario : []), [payload]);
 
@@ -4451,17 +5226,22 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         addPessoaValida(fiscaisTitulares, item.fiscal);
         addPessoaValida(fiscaisSubstitutos, item.fiscal_sub);
         if (item.contrato && item.contrato.trim() !== "" && item.contrato !== "-") {
-          if (!uniqueContratos.has(item.contrato.trim())) {
-            uniqueContratos.add(item.contrato.trim());
+          if (!uniqueContratos.has(UnifiedData.key(item.contrato))) {
+            uniqueContratos.add(UnifiedData.key(item.contrato));
             if (item.situacaoFlags && item.situacaoFlags.some(f => f.label === 'CAN')) qtdCancelados++;
             if (item.situacaoFlags && item.situacaoFlags.some(f => f.label === 'BLOQ')) qtdBloqueados++;
             totalGlobal += item.v_global || 0;
-            if (item.situacaoFlags && item.situacaoFlags.some(f => f.label.startsWith('ATIVO'))) {
+            if (ContractRules.phase(item) === 'vigente') {
               qtdAtivos++;
-              if (item.situacaoFlags.some(f => f.label === 'ATIVO INEXEC')) qtdAtivosInexec++;else if (item.situacaoFlags.some(f => f.label === 'ATIVO EM EXEC')) qtdAtivosEmExec++;else if (item.situacaoFlags.some(f => f.label === 'ATIVO EXEC TOT')) qtdAtivosExecTot++;else if (item.situacaoFlags.some(f => f.label === 'ATIVO EXEC PARC')) qtdAtivosExecParc++;
-            } else if (item.situacaoFlags && item.situacaoFlags.some(f => f.label.startsWith('VENC'))) {
+              if (item.situacaoFlags.some(f => f.label === 'VIG SEM EXEC')) qtdAtivosInexec++;
+              if (item.situacaoFlags.some(f => f.label === 'VIG EM EXEC')) qtdAtivosEmExec++;
+              if (item.situacaoFlags.some(f => f.label === 'VIG EXEC TOTAL')) qtdAtivosExecTot++;
+              if (item.situacaoFlags.some(f => f.label === 'VIG EXEC PARCIAL')) qtdAtivosExecParc++;
+            } else if (ContractRules.phase(item) === 'vencido') {
               qtdVencidos++;
-              if (item.situacaoFlags.some(f => f.label === 'VENC INEXEC TOT')) qtdVencInexecTot++;else if (item.situacaoFlags.some(f => f.label === 'VENC EXEC TOT')) qtdVencidosTot++;else if (item.situacaoFlags.some(f => f.label === 'VENC EXEC PARC')) qtdVencidosParc++;
+              if (item.situacaoFlags.some(f => f.label === 'VENC INEXEC TOTAL')) qtdVencInexecTot++;
+              if (item.situacaoFlags.some(f => f.label === 'VENC EXEC TOTAL')) qtdVencidosTot++;
+              if (item.situacaoFlags.some(f => f.label === 'VENC EXEC PARCIAL')) qtdVencidosParc++;
             }
           }
         }
@@ -4507,8 +5287,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         if (!item.diaVal || !item.contrato || item.contrato === "-") return;
         const doc = item.documento ? item.documento.toUpperCase() : "";
         if (doc.includes("NE") || doc.includes("RO")) {
-          if (!map[item.contrato] || item.diaVal < map[item.contrato].minDate) {
-            map[item.contrato] = {
+          if (!map[UnifiedData.key(item.contrato)] || item.diaVal < map[UnifiedData.key(item.contrato)].minDate) {
+            map[UnifiedData.key(item.contrato)] = {
               minDate: item.diaVal,
               ano: new Date(item.diaVal).getFullYear()
             };
@@ -4522,13 +5302,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       filteredData.forEach(item => {
         if (!item.contrato || item.contrato === "-") return;
         let key = '';
-        if (viewMode === 'contrato') key = item.contrato;else if (viewMode === 'favorecido') key = item.favorecido;else if (viewMode === 'empenho') key = item.empenho;else if (viewMode === 'ano') {
-          const origem = contratoAnoOrigem[item.contrato];
+        if (viewMode === 'contrato') key = UnifiedData.key(item.contrato);else if (viewMode === 'favorecido') key = item.favorecido;else if (viewMode === 'empenho') key = item.empenho;else if (viewMode === 'ano') {
+          const origem = contratoAnoOrigem[UnifiedData.key(item.contrato)];
           key = origem ? origem.ano.toString() : 'N/I';
         } else if (viewMode === 'sec_log') key = item.sec_log;
         if (!map[key]) {
           map[key] = {
-            label: key,
+            label: viewMode === 'contrato' ? item.contrato : key,
             contratos: new Set(),
             empenhado: 0,
             recebido: 0,
@@ -4540,7 +5320,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             contrato: item.contrato
           };
         }
-        map[key].contratos.add(item.contrato);
+        map[key].contratos.add(UnifiedData.key(item.contrato));
         map[key].empenhado += item.v_empenhado;
         map[key].recebido += item.v_recebido;
         map[key].liquidado += item.v_liquidado;
@@ -4776,6 +5556,22 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       };
     }, [filteredData, areaAggLevel, areaXAxisMode]);
     const barChartData = useMemo(() => calculateAggregatedData(barAggLevel, barXAxisMode === 'normalizada'), [filteredData, barAggLevel, barXAxisMode]);
+    const documentDateRange = useMemo(() => {
+      var _first, _first2, _last, _last2;
+      let first = null,
+        last = null;
+      filteredData.forEach(row => {
+        if (!row.documento || row.documento === '-' || !Number.isFinite(row.diaVal) || row.diaVal <= 0) return;
+        if (!first || row.diaVal < first.diaVal) first = row;
+        if (!last || row.diaVal > last.diaVal) last = row;
+      });
+      return {
+        firstDate: ((_first = first) === null || _first === void 0 ? void 0 : _first.dia) || '',
+        firstValue: ((_first2 = first) === null || _first2 === void 0 ? void 0 : _first2.diaVal) || null,
+        lastDate: ((_last = last) === null || _last === void 0 ? void 0 : _last.dia) || '',
+        lastValue: ((_last2 = last) === null || _last2 === void 0 ? void 0 : _last2.diaVal) || null
+      };
+    }, [filteredData]);
     const latestDocs = useMemo(() => {
       const getLatestList = field => {
         const hasField = field.replace('v_', 'has_');
@@ -4859,7 +5655,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         if (matrixGroupBy === 'contrato_favorecido') {
           return {
-            key: JSON.stringify([contrato, favorecido]),
+            key: JSON.stringify([UnifiedData.key(contrato), favorecido]),
             sec_log: secLog,
             contrato,
             compra: item.compra,
@@ -4872,7 +5668,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         if (matrixGroupBy === 'contrato_favorecido_objeto') {
           return {
-            key: JSON.stringify([contrato, favorecido, objeto]),
+            key: JSON.stringify([UnifiedData.key(contrato), favorecido, objeto]),
             sec_log: secLog,
             contrato,
             compra: item.compra,
@@ -4885,7 +5681,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         if (matrixGroupBy === 'contrato_nd') {
           return {
-            key: JSON.stringify([contrato, ndCodigo]),
+            key: JSON.stringify([UnifiedData.key(contrato), ndCodigo]),
             sec_log: secLog,
             contrato,
             compra: item.compra,
@@ -4898,7 +5694,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         if (matrixGroupBy === 'sec_log_contrato_empenho') {
           return {
-            key: JSON.stringify([secLog, contrato, empenho]),
+            key: JSON.stringify([secLog, UnifiedData.key(contrato), empenho]),
             sec_log: secLog,
             contrato,
             compra: item.compra,
@@ -4910,7 +5706,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           };
         }
         return {
-          key: JSON.stringify([contrato, empenho]),
+          key: JSON.stringify([UnifiedData.key(contrato), empenho]),
           sec_log: secLog,
           contrato,
           compra: item.compra,
@@ -5351,6 +6147,9 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     return {
       contractKeys,
       filteredRows: filteredData,
+      rawRows: rawData,
+      ready: processedPayload === payload && !!payload,
+      dateRange: documentDateRange,
       options: filterOptions,
       budgetIndex,
       docStats,
@@ -5478,14 +6277,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         className: "flex justify-between items-center mb-4 border-b border-slate-100 pb-2 flex-wrap gap-2"
       }, /*#__PURE__*/React.createElement("h3", {
         className: "text-xs font-black text-slate-800 uppercase"
-      }, "\xDAltimos Lan\xE7amentos Cont\xE1beis (At\xE9 10 docs)"), latestDocs.empenhado.length > 0 && /*#__PURE__*/React.createElement("div", {
+      }, "\xDAltimos Lan\xE7amentos Cont\xE1beis (At\xE9 10 docs)"), documentDateRange.lastValue !== null && /*#__PURE__*/React.createElement("div", {
         className: "text-[10px] font-black text-red-600 bg-red-50 border border-red-200 px-2 py-1 rounded shadow-sm flex items-center gap-1 shrink-0"
       }, /*#__PURE__*/React.createElement("span", {
         className: "uppercase"
       }, "\xDAltimo Dia de Lan\xE7amento:"), /*#__PURE__*/React.createElement("span", {
         className: "text-[11px]"
-      }, latestDocs.empenhado[0].dia || ''))), /*#__PURE__*/React.createElement("div", {
-        className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 h-[300px]"
+      }, documentDateRange.lastDate))), /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 min-h-[300px]"
       }, /*#__PURE__*/React.createElement(LatestDocCard, {
         title: "EMPENHADO",
         docs: latestDocs.empenhado,
@@ -5513,14 +6312,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         className: "flex justify-between items-center mb-4 border-b border-slate-100 pb-2 flex-wrap gap-2"
       }, /*#__PURE__*/React.createElement("h3", {
         className: "text-xs font-black text-slate-800 uppercase"
-      }, "Os Primeiros Lan\xE7amentos Cont\xE1beis (At\xE9 10 docs)"), primeirosDocs.empenhado.length > 0 && /*#__PURE__*/React.createElement("div", {
+      }, "Primeiros Lan\xE7amentos Cont\xE1beis (At\xE9 10 docs)"), documentDateRange.firstValue !== null && /*#__PURE__*/React.createElement("div", {
         className: "text-[10px] font-black text-red-600 bg-red-50 border border-red-200 px-2 py-1 rounded shadow-sm flex items-center gap-1 shrink-0"
       }, /*#__PURE__*/React.createElement("span", {
         className: "uppercase"
       }, "Primeiro Dia de Lan\xE7amento:"), /*#__PURE__*/React.createElement("span", {
         className: "text-[11px]"
-      }, primeirosDocs.empenhado[0].dia || ''))), /*#__PURE__*/React.createElement("div", {
-        className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 h-[300px]"
+      }, documentDateRange.firstDate))), /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 min-h-[300px]"
       }, /*#__PURE__*/React.createElement(LatestDocCard, {
         title: "EMPENHADO",
         docs: primeirosDocs.empenhado,
@@ -5543,88 +6342,17 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         metricField: "v_pago",
         colorClass: "border-emerald-500 text-emerald-600"
       }))), /*#__PURE__*/React.createElement("div", {
-        className: "grid grid-cols-1 xl:grid-cols-3 gap-8 mb-10"
+        className: "grid grid-cols-1 gap-8 mb-10"
       }, /*#__PURE__*/React.createElement("div", {
-        className: "xl:col-span-1 bg-white p-6 rounded-2xl shadow-sm border border-slate-200"
+        className: "bg-white p-6 rounded-2xl shadow-sm border border-slate-200"
       }, /*#__PURE__*/React.createElement("h3", {
         className: "text-xs font-black text-slate-800 uppercase mb-4"
-      }, "Composi\xE7\xE3o de Documentos"), /*#__PURE__*/React.createElement("div", {
-        className: "flex flex-col gap-6 h-full justify-between pb-4"
-      }, /*#__PURE__*/React.createElement("div", {
-        className: "relative h-[200px]"
-      }, /*#__PURE__*/React.createElement("h4", {
-        className: "text-[10px] font-bold text-slate-500 text-center mb-1 absolute w-full top-[-20px]"
-      }, "QTD DE DOCUMENTOS \xDANICOS"), /*#__PURE__*/React.createElement(ChartComponent, {
-        id: "doughnutQtd",
-        type: "doughnut",
-        data: {
-          labels: ['Empenhado', 'Recebido', 'Liquidado', 'Pago'],
-          datasets: [{
-            data: [docCounts.empenhado, docCounts.recebido, docCounts.liquidado, docCounts.pago],
-            backgroundColor: ['#3b82f6', '#8b5cf6', '#f59e0b', '#10b981']
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          cutout: '65%',
-          plugins: {
-            tooltip: {
-              callbacks: {
-                label: function (ctx) {
-                  return ` Qtd Documentos: ${ctx.raw}`;
-                }
-              }
-            },
-            datalabels: {
-              color: '#ffffff',
-              font: {
-                weight: 'bold',
-                size: 10
-              },
-              formatter: (value, ctx) => {
-                let sum = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0);
-                if (sum === 0 || value === 0) return null;
-                return (value * 100 / sum).toFixed(1) + '%';
-              },
-              textStrokeColor: 'rgba(0,0,0,0.6)',
-              textStrokeWidth: 2
-            },
-            legend: {
-              display: false
-            }
-          }
-        }
-      }), /*#__PURE__*/React.createElement("div", {
-        className: "absolute inset-0 flex flex-col items-center justify-center pointer-events-none mt-4"
-      }, /*#__PURE__*/React.createElement("span", {
-        className: "text-2xl font-black text-slate-700 leading-none"
-      }, totalUniqueDocs.toLocaleString('pt-BR')), /*#__PURE__*/React.createElement("span", {
-        className: "text-[8px] font-bold text-slate-400 uppercase mt-1"
-      }, "Total Docs"))), /*#__PURE__*/React.createElement("div", {
-        className: "h-[280px] pt-4"
-      }, /*#__PURE__*/React.createElement("h4", {
-        className: "text-[10px] font-bold text-slate-500 text-center mb-1"
-      }, "VOLUME FINANCEIRO TOTAL (R$)"), /*#__PURE__*/React.createElement(FunnelChart, {
-        data: [{
-          label: 'EMPENHADO',
-          value: kpis.totalEmpenhado,
-          color: 'bg-blue-500'
-        }, {
-          label: 'RECEBIDO',
-          value: kpis.totalRecebido,
-          color: 'bg-violet-500'
-        }, {
-          label: 'LIQUIDADO',
-          value: kpis.totalLiquidado,
-          color: 'bg-amber-500'
-        }, {
-          label: 'PAGO',
-          value: kpis.totalPago,
-          color: 'bg-emerald-500'
-        }]
-      })))), /*#__PURE__*/React.createElement("div", {
-        className: "xl:col-span-2 bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col overflow-hidden"
+      }, "Composi\xE7\xE3o de Documentos"), /*#__PURE__*/React.createElement(DocumentComposition, {
+        counts: docCounts,
+        amounts: totalsMaster,
+        uniqueDocs: totalUniqueDocs
+      })), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col overflow-hidden"
       }, /*#__PURE__*/React.createElement("div", {
         className: "bg-slate-800 px-4 py-3 flex justify-between items-center flex-wrap gap-2"
       }, /*#__PURE__*/React.createElement("h3", {
@@ -6665,11 +7393,16 @@ function Dashboard() {
   const [linkDiagnostics, setLinkDiagnostics] = useState(null);
   const [resetRevision, setResetRevision] = useState(0);
   const loadingRef = useRef(false);
+  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV3') === '1');
+  const closeSummary = React.useCallback(() => {
+    sessionStorage.removeItem('summary_pending_TotalV3');
+    setSummaryRequested(false);
+  }, []);
   const [activePage, setActivePage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("A verificar sessão local...");
-  const currentUser = sessionStorage.getItem('user_TotalV2') || 'Usuário';
-  const currentPerfil = sessionStorage.getItem('perfil_TotalV2') || '';
+  const currentUser = sessionStorage.getItem('user_TotalV3') || 'Usuário';
+  const currentPerfil = sessionStorage.getItem('perfil_TotalV3') || '';
 
   // Estado de Expansão Global das seções
   const [globalExpandState, setGlobalExpandState] = useState(false);
@@ -6699,7 +7432,7 @@ function Dashboard() {
     correlacao: false
   });
   const [fornecedorSort, setFornecedorSort] = useState('valor_desc');
-  const [contratoSort, setContratoSort] = useState('valor_desc');
+  const [contratoSort, setContratoSort] = useState('dias_asc');
   const [scatterXAxis, setScatterXAxis] = useState('p_recebido');
   const [scatterHiddenTags, setScatterHiddenTags] = useState([]);
   const toggleChartTableView = key => setChartTableViews(previous => ({
@@ -6730,6 +7463,10 @@ function Dashboard() {
   const [fPiNome, setFPiNome] = useState([]);
   const [fNdCodigo, setFNdCodigo] = useState([]);
   const [fNdNome, setFNdNome] = useState([]);
+  const [fGrupo, setFGrupo] = useState([]);
+  const [fNdModalidade, setFNdModalidade] = useState([]);
+  const [fElemento, setFElemento] = useState([]);
+  const [fSubelemento, setFSubelemento] = useState([]);
   const [dInicDe, setDInicDe] = useState("");
   const [dInicAte, setDInicAte] = useState("");
   const [dFimDe, setDFimDe] = useState("");
@@ -6959,6 +7696,10 @@ function Dashboard() {
     setFPiNome([]);
     setFNdCodigo([]);
     setFNdNome([]);
+    setFGrupo([]);
+    setFNdModalidade([]);
+    setFElemento([]);
+    setFSubelemento([]);
     setFFiscal([]);
     setFGestor([]);
     setFFiscalSub([]);
@@ -7079,11 +7820,12 @@ function Dashboard() {
   const toggleNonCSup = () => {
     if (isNonCSupActive) setFSecLog([]);else setFSecLog(nonCSupItems);
   };
+  const showCOLOG = () => setFSecLog([]);
   const logout = () => {
     clearAuthStorage();
     try {
       localStorage.removeItem(DASH_CACHE_KEY);
-      localStorage.removeItem('dashData_TotalV2');
+      localStorage.removeItem('dashData_TotalV3');
     } catch (e) {}
     window.location.reload();
   };
@@ -7106,6 +7848,10 @@ function Dashboard() {
     fPiNome,
     fNdCodigo,
     fNdNome,
+    fGrupo,
+    fNdModalidade,
+    fElemento,
+    fSubelemento,
     dInicDe,
     dInicAte,
     dFimDe,
@@ -7115,7 +7861,7 @@ function Dashboard() {
     fPo,
     fPi,
     fNd
-  }), [fContrato, fFiscal, fGestor, fFiscalSub, fGestorSub, fSecLog, fCompra, fModalidade, fSituacaoTags, fAoCodigo, fAoNome, fPoCodigo, fPoNome, fPtres, fPiCod, fPiNome, fNdCodigo, fNdNome, dInicDe, dInicAte, dFimDe, dFimAte, fFornecedor, fAo, fPo, fPi, fNd]);
+  }), [fContrato, fFiscal, fGestor, fFiscalSub, fGestorSub, fSecLog, fCompra, fModalidade, fSituacaoTags, fAoCodigo, fAoNome, fPoCodigo, fPoNome, fPtres, fPiCod, fPiNome, fNdCodigo, fNdNome, fGrupo, fNdModalidade, fElemento, fSubelemento, dInicDe, dInicAte, dFimDe, dFimAte, fFornecedor, fAo, fPo, fPi, fNd]);
   const documentDashboard = DocumentModule.useDashboard({
     payload: apiPayload,
     shared: sharedFilters,
@@ -7178,7 +7924,9 @@ function Dashboard() {
       const normalizedName = (name || '').toString().trim().toUpperCase();
       const normalizedCode = (code || '').toString().trim().toUpperCase();
       if ((!normalizedName || normalizedName === '-') && (!normalizedCode || normalizedCode === '-')) return;
-      accumulator[key].add(normalizedName && normalizedName !== '-' ? `${normalizedName} – ${normalizedCode && normalizedCode !== '-' ? normalizedCode : 'N/I'}` : normalizedCode);
+      const codeFirst = key === 'ao_filter_values' || key === 'po_filter_values';
+      const pairCode = normalizedCode && normalizedCode !== '-' ? normalizedCode : 'N/I';
+      accumulator[key].add(normalizedName && normalizedName !== '-' ? codeFirst ? `${pairCode} – ${normalizedName}` : `${normalizedName} – ${pairCode}` : normalizedCode);
     };
     const normalizeDimension = value => {
       const normalized = String(value || '').trim().toUpperCase();
@@ -7198,8 +7946,12 @@ function Dashboard() {
       const piNome = getValue(row, ['PI Nome'], ['pi nome']);
       const ndCodigo = getValue(row, ['ND_DOC', 'ND Código', 'ND Codigo'], ['nd doc']);
       const ndNome = getValue(row, ['ND_NOME', 'ND Nome'], ['nd nome']);
-      const ndCodigoValues = splitBudgetDimensionValue(ndCodigo);
-      const ndNomeValues = splitBudgetDimensionValue(ndNome);
+      const ndRecords = UnifiedData.ndParts({
+        nd_codigo: ndCodigo,
+        nd_nome: ndNome
+      });
+      const ndCodigoValues = ndRecords.map(part => part.code);
+      const ndNomeValues = ndRecords.map(part => part.name);
       const ptres = getValue(row, ['PTRES Código', 'PTRES Codigo', 'PTRES'], ['ptres codigo', 'ptres']);
       const documento = getValue(row, ['Documento CCor Número', 'Documento CCor Numero', 'DOCUMENTO_CCOR_NUMERO'], ['documento ccor']);
       addValue(target, 'ao_codigo_values', aoCodigo);
@@ -7219,6 +7971,7 @@ function Dashboard() {
       const detail = {
         contrato,
         documento: normalizeDimension(documento),
+        ug: getValue(row, ['Emitente - UG Código', 'Emitente - UG Codigo', 'UG Emitente', 'UG Código', 'UG Codigo']),
         ao_codigo: normalizeDimension(aoCodigo),
         ao_nome: normalizeDimension(aoNome),
         po_codigo: normalizeDimension(poCodigo),
@@ -7235,8 +7988,8 @@ function Dashboard() {
         v_bloqueado: parseValue(getValue(row, ['TOTAL BLOQUEADO'], ['total bloqueado'])),
         v_recebido: recebidoByDocumento[documentKey] || 0
       };
-      detail.ao_filter = detail.ao_nome !== 'N/I' ? `${detail.ao_nome} – ${detail.ao_codigo}` : detail.ao_codigo;
-      detail.po_filter = detail.po_nome !== 'N/I' ? `${detail.po_nome} – ${detail.po_codigo}` : detail.po_codigo;
+      detail.ao_filter = detail.ao_nome !== 'N/I' ? `${detail.ao_codigo} – ${detail.ao_nome}` : detail.ao_codigo;
+      detail.po_filter = detail.po_nome !== 'N/I' ? `${detail.po_codigo} – ${detail.po_nome}` : detail.po_codigo;
       detail.pi_filter = detail.pi_nome !== 'N/I' ? `${detail.pi_nome} – ${detail.pi_codigo}` : detail.pi_codigo;
       detail.nd_filter_values = ndCodigoValues.map((code, index) => {
         const name = ndNomeValues[index] || (ndNomeValues.length === 1 ? ndNomeValues[0] : '');
@@ -7246,7 +7999,7 @@ function Dashboard() {
       detail.v_a_liquidar = detail.v_empenhado - detail.v_liquidado - detail.v_cancelado - detail.v_bloqueado;
       detail.v_a_pagar = detail.v_empenhado - detail.v_pago - detail.v_cancelado - detail.v_bloqueado;
       detail.v_executado = detail.v_liquidado + detail.v_cancelado + detail.v_bloqueado;
-      const detailKey = [documentKey, detail.ao_codigo, detail.ao_nome, detail.po_codigo, detail.po_nome, detail.pi_codigo, detail.pi_nome, detail.ptres, detail.nd_codigo, detail.nd_nome].join('|');
+      const detailKey = [documentKey, UnifiedData.key(detail.ug), detail.ao_codigo, detail.ao_nome, detail.po_codigo, detail.po_nome, detail.pi_codigo, detail.pi_nome, detail.ptres, detail.nd_codigo, detail.nd_nome].join('|');
       const previous = target.orc_detail_rows.get(detailKey);
       if (!previous) target.orc_detail_rows.set(detailKey, detail);else {
         ['v_empenhado', 'v_liquidado', 'v_pago', 'v_cancelado', 'v_bloqueado', 'v_recebido', 'v_a_liquidar', 'v_a_pagar', 'v_executado'].forEach(metric => {
@@ -7287,45 +8040,6 @@ function Dashboard() {
     orc_detail_rows: []
   });
   const normalizeContractKey = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const buildRecebidoByContrato = contabilRows => {
-    const recebidoByContrato = {};
-    if (!contabilRows || contabilRows.length < 2) return recebidoByContrato;
-    const headers = contabilRows[0] || [];
-    const headerMap = {};
-    headers.forEach((header, index) => {
-      const normalized = normalizeStr(header);
-      if (normalized) headerMap[normalized] = index;
-    });
-    const getValue = function (row, exactNames) {
-      let fallbackKeywords = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [];
-      for (const name of exactNames) {
-        const index = headerMap[normalizeStr(name)];
-        if (index !== undefined && row[index] !== undefined && row[index] !== null) {
-          return row[index].toString().trim();
-        }
-      }
-      for (const keyword of fallbackKeywords) {
-        const normalizedKeyword = normalizeStr(keyword);
-        const headerKey = Object.keys(headerMap).find(key => key.includes(normalizedKeyword));
-        if (headerKey) {
-          const value = row[headerMap[headerKey]];
-          return value !== undefined && value !== null ? value.toString().trim() : '';
-        }
-      }
-      return '';
-    };
-    contabilRows.slice(1).forEach(row => {
-      if (!row || !row.length) return;
-      const contractKey = normalizeContractKey(getValue(row, ['COL_NR_CONTR_BASE', 'Contrato', 'Número Contrato', 'Numero Contrato'], ['contr base', 'contrato']));
-      if (!contractKey) return;
-      const information = getValue(row, ['ITEM_INFORMACAO', 'INTEN_INFORMACAO', 'Informação', 'Informacao'], ['item informacao', 'inten informacao', 'informacao']);
-      const rowIndicatesRecebido = normalizeStr(information).includes('recebido') || !information && normalizeStr(row.join(' ')).includes('recebido');
-      if (!rowIndicatesRecebido) return;
-      const rawValue = getValue(row, ['Valor Item (R$)', 'Valor (R$)', 'Valor'], ['valor item', 'valor', 'vlr', 'montante', 'saldo']);
-      recebidoByContrato[contractKey] = (recebidoByContrato[contractKey] || 0) + parseValue(rawValue);
-    });
-    return recebidoByContrato;
-  };
   const buildRecebidoByDocumento = contabilRows => {
     const recebidoByDocumento = {};
     if (!contabilRows || contabilRows.length < 2) return recebidoByDocumento;
@@ -7368,21 +8082,28 @@ function Dashboard() {
       setLoading(false);
       return;
     }
+    const ledgerIndex = ContractRules.accountingBalances(contabilRows);
     setApiPayload({
       geral: rowsArray,
       contabil: contabilRows,
-      orcamentario: orcamentarioRows
+      orcamentario: orcamentarioRows,
+      ledgerIndex
     });
     setStatus("A estruturar matriz de dados...");
     const headers = rowsArray[0];
     const normalizedHeaders = headers.map(normalizeStr);
     const headerIndices = new Map(normalizedHeaders.map((value, index) => [value, index]));
-    const recebidoByContrato = buildRecebidoByContrato(contabilRows);
+    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref42 => {
+      let [contract, totals] = _ref42;
+      return [contract, totals.v_recebido];
+    }));
+    const receivedAssigned = new Set();
     const recebidoByDocumento = buildRecebidoByDocumento(contabilRows);
     const orcamentarioByContrato = buildOrcamentarioByContrato(orcamentarioRows, recebidoByDocumento);
     const hoje = new Date();
     hoje.setHours(0, 0, 0, 0);
-    const mappedRaw = rowsArray.slice(1).map(row => {
+    const uniqueRows = new Map(rowsArray.slice(1).map(row => [JSON.stringify(row), row]));
+    const mappedRaw = [...uniqueRows.values()].map(row => {
       var _Object$entries$find;
       const getVal = function (exactNames) {
         let fallbackKeywords = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
@@ -7417,9 +8138,11 @@ function Dashboard() {
       const v_cancelado = parseValue(getVal(["TOTAL CANCELADO"]));
       const v_bloqueado = parseValue(getVal(["TOTAL BLOQUEADO"]));
       const contrato = (getVal(["Número Contrato", "numero_contrato", "COL_NR_CONTR_BASE"]) || "-").toUpperCase();
-      const v_recebido = recebidoByContrato[normalizeContractKey(contrato)] || 0;
-      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref30 => {
-        let [key] = _ref30;
+      const receivedKey = normalizeContractKey(contrato);
+      const v_recebido = receivedAssigned.has(receivedKey) ? 0 : recebidoByContrato[receivedKey] || 0;
+      receivedAssigned.add(receivedKey);
+      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref43 => {
+        let [key] = _ref43;
         return normalizeContractKey(key) === normalizeContractKey(contrato);
       })) === null || _Object$entries$find === void 0 ? void 0 : _Object$entries$find[1]) || emptyOrcamentario();
       const v_a_liquidar = v_empenhado - v_liquidado - v_cancelado - v_bloqueado;
@@ -7433,7 +8156,7 @@ function Dashboard() {
         ao_codigos: orcamentario.ao_codigo_values.join('; ') || '-',
         po_codigos: orcamentario.po_codigo_values.join('; ') || '-',
         nd_codigos: orcamentario.nd_codigo_values.join('; ') || '-',
-        fornecedor: (getVal(["Fornecedor"]) || "-").toUpperCase(),
+        fornecedor: (getVal(["Fornecedor"]) || "N/I").toUpperCase(),
         objeto: (getVal(["Objeto"]) || "-").toUpperCase(),
         fiscal: (getVal(["FISCAL_TITULAR", "Fiscal Titular"]) || "N/I").toUpperCase(),
         gestor: (getVal(["GESTOR_TITULAR", "Gestor Titular"]) || "N/I").toUpperCase(),
@@ -7470,83 +8193,31 @@ function Dashboard() {
         p_cancelado: parsePercentAsFloat(getVal(["TOTAL CANCELADO %"])),
         p_executado: parsePercentAsFloat(getVal(["TOTAL EXECUTADO %"]))
       };
-    }).filter(r => r.contrato !== "-" && r.fornecedor !== "-");
-
-    // Agregação para definição das Situações Globais Exatas
-    const cTotals = {};
-    mappedRaw.forEach(r => {
-      if (!cTotals[r.contrato]) cTotals[r.contrato] = {
-        v_empenhado: 0,
-        v_recebido: 0,
-        v_liquidado: 0,
-        v_pago: 0,
-        v_executado: 0,
-        v_bloqueado: 0,
-        v_cancelado: 0,
-        v_a_liquidar: 0,
-        v_a_pagar: 0,
-        encerrando_dias: r.encerrando_dias
-      };
-      cTotals[r.contrato].v_empenhado += r.v_empenhado || 0;
-      cTotals[r.contrato].v_recebido += r.v_recebido || 0;
-      cTotals[r.contrato].v_liquidado += r.v_liquidado || 0;
-      cTotals[r.contrato].v_pago += r.v_pago || 0;
-      cTotals[r.contrato].v_executado += r.v_executado || 0;
-      cTotals[r.contrato].v_bloqueado += r.v_bloqueado || 0;
-      cTotals[r.contrato].v_cancelado += r.v_cancelado || 0;
-      cTotals[r.contrato].v_a_liquidar += r.v_a_liquidar || 0;
-      cTotals[r.contrato].v_a_pagar += r.v_a_pagar || 0;
-      if (r.encerrando_dias !== null) {
-        cTotals[r.contrato].encerrando_dias = r.encerrando_dias;
-      }
-    });
+    }).filter(r => r.contrato !== "-");
+    const canonicalIndex = ContractRules.contractIndex(mappedRaw);
+    const canonicalClassifications = new Map([...canonicalIndex].map(_ref44 => {
+      var _ledgerIndex$get;
+      let [id, entry] = _ref44;
+      return [id, ContractRules.classify(entry.totals, entry.metadata, (_ledgerIndex$get = ledgerIndex.get(id)) === null || _ledgerIndex$get === void 0 ? void 0 : _ledgerIndex$get.hasMovement, hoje)];
+    }));
 
     // Árvore de Decisão de TAGS
     mappedRaw.forEach(r => {
-      const c = cTotals[r.contrato];
+      const canonicalKey = UnifiedData.key(r.contrato);
+      const entry = canonicalIndex.get(canonicalKey);
+      const c = entry.totals;
+      r.contract_metadata = entry.metadata;
+      r.contract_metadata_conflicts = [...entry.conflicts];
       r.contrato_empenhado_total = c.v_empenhado;
       r.dif_global = r.v_global - r.v_empenhado;
-      let flags = [];
-      let sitText = "";
-      if (c.v_cancelado > 0) {
-        flags.push({
-          label: 'CAN',
-          color: tagColorsMap['CAN'].css,
-          hex: tagColorsMap['CAN'].hex
-        });
-        sitText += "CAN ";
-      }
-      if (c.v_bloqueado > 0) {
-        flags.push({
-          label: 'BLOQ',
-          color: tagColorsMap['BLOQ'].css,
-          hex: tagColorsMap['BLOQ'].hex
-        });
-        sitText += "BLOQ ";
-      }
-      if (c.encerrando_dias !== null) {
-        const isAtivo = c.encerrando_dias >= 0;
-        const isLiquidadoZero = c.v_liquidado <= 0.01;
-        const isPagoZero = c.v_pago <= 0.01;
-        const isPagoIgualEmpenhado = c.v_pago >= c.v_empenhado - 0.01 && c.v_empenhado > 0;
-        const isExecutadoIgualEmpenhado = c.v_executado >= c.v_empenhado - 0.01 && c.v_empenhado > 0;
-        const isPagoMenorEmpenhado = c.v_pago < c.v_empenhado - 0.01;
-        const isExecutadoMenorEmpenhado = c.v_executado < c.v_empenhado - 0.01;
-        let tagKey = null;
-        if (isAtivo) {
-          if (isLiquidadoZero) tagKey = 'ATIVO INEXEC';else if (isExecutadoMenorEmpenhado) tagKey = 'ATIVO EM EXEC';else if (isPagoIgualEmpenhado) tagKey = 'ATIVO EXEC TOT';else if (isPagoMenorEmpenhado && isExecutadoIgualEmpenhado) tagKey = 'ATIVO EXEC PARC';
-        } else {
-          if (isPagoZero) tagKey = 'VENC INEXEC TOT';else if (isPagoIgualEmpenhado) tagKey = 'VENC EXEC TOT';else if (isPagoMenorEmpenhado && isExecutadoIgualEmpenhado) tagKey = 'VENC EXEC PARC';
-        }
-        if (tagKey) {
-          flags.push({
-            label: tagKey,
-            color: tagColorsMap[tagKey].css,
-            hex: tagColorsMap[tagKey].hex
-          });
-          sitText += `${tagKey} `;
-        }
-      }
+      const classification = canonicalClassifications.get(canonicalKey);
+      const flags = classification.labels.map(label => ({
+        label,
+        color: tagColorsMap[label].css,
+        hex: tagColorsMap[label].hex
+      }));
+      const sitText = classification.labels.join(' ');
+      r.situacao_principal = classification.primary;
       r.situacaoFlags = flags;
       r.situacao = sitText.trim() || 'N/I';
     });
@@ -7572,8 +8243,8 @@ function Dashboard() {
       return;
     }
     try {
-      setStatus("A transferir dados via Apps Script...");
-      const token = sessionStorage.getItem('token_TotalV2');
+      setStatus("A transferir dados via Api...");
+      const token = sessionStorage.getItem('token_TotalV3');
       if (!token) throw new Error("Token de acesso não encontrado. Faça login novamente.");
       const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}`);
       const json = await readAppsScriptJson(response, 'a sincronização dos dados');
@@ -7594,8 +8265,7 @@ function Dashboard() {
       processData(rows, json.contabil || [], json.orcamentario || [], false);
       setLinkDiagnostics(json.diagnosticoOrcamentario || null);
       const controle = json.controleAcesso || {};
-      const extra = controle.restantes !== null && controle.restantes !== undefined ? ` | Acessos restantes: ${controle.restantes}` : '';
-      setStatus(`Online - Dados carregados via Apps Script${extra}`);
+      setStatus(`Online - Dados carregados via Api | ${ContractRules.accessText(controle)}`);
     } catch (error) {
       console.error(error);
       setStatus(error.message || "Falha de acesso à API. Tente sincronizar novamente.");
@@ -7609,7 +8279,7 @@ function Dashboard() {
   }, []);
   const filterOptions = useMemo(() => {
     const scalarFields = ['fiscal', 'gestor', 'fiscal_sub', 'gestor_sub', 'sec_log', 'contrato', 'compra', 'modalidade', 'fornecedor'];
-    const arrayFields = ['ao_filter_values', 'po_filter_values', 'ptres_values', 'pi_filter_values', 'nd_filter_values', 'ao_codigo_values', 'ao_nome_values', 'po_codigo_values', 'po_nome_values', 'pi_cod_values', 'pi_nome_values', 'nd_codigo_values', 'nd_nome_values'];
+    const arrayFields = ['ao_filter_values', 'po_filter_values', 'ptres_values', 'pi_filter_values', 'nd_filter_values', 'ao_codigo_values', 'ao_nome_values', 'po_codigo_values', 'po_nome_values', 'pi_cod_values', 'pi_nome_values', 'nd_codigo_values', 'nd_nome_values', 'nd_grupo_values', 'nd_modalidade_values', 'nd_elemento_values', 'nd_subelemento_filter_values'];
     const accumulators = {};
     [...scalarFields, ...arrayFields].forEach(field => {
       accumulators[field] = new Set();
@@ -7643,11 +8313,15 @@ function Dashboard() {
       pi_cod_values: 'pi_codigo',
       pi_nome_values: 'pi_nome',
       nd_codigo_values: 'nd_codigo',
-      nd_nome_values: 'nd_nome'
+      nd_nome_values: 'nd_nome',
+      nd_grupo_values: 'nd_grupo_values',
+      nd_modalidade_values: 'nd_modalidade_values',
+      nd_elemento_values: 'nd_elemento_values',
+      nd_subelemento_filter_values: 'nd_subelemento_filter_values'
     };
     documentDashboard.budgetIndex.byContract.forEach(details => details.forEach(detail => {
-      Object.entries(budgetOptionsMap).forEach(_ref31 => {
-        let [field, property] = _ref31;
+      Object.entries(budgetOptionsMap).forEach(_ref45 => {
+        let [field, property] = _ref45;
         const values = Array.isArray(detail[property]) ? detail[property] : splitBudgetDimensionValue(detail[property]);
         values.forEach(value => {
           if (value && value !== '-' && value !== 'N/I') accumulators[field].add(value);
@@ -7738,20 +8412,13 @@ function Dashboard() {
     const details = [];
     const processedContracts = new Set();
     filteredData.forEach(item => {
-      if (processedContracts.has(item.contrato)) return;
-      processedContracts.add(item.contrato);
+      if (processedContracts.has(UnifiedData.key(item.contrato))) return;
+      processedContracts.add(UnifiedData.key(item.contrato));
       (item.orc_detail_rows || []).forEach(detail => {
-        const matches = (selected, value) => selected.length === 0 || selected.includes(value);
-        if (!UnifiedData.matchesBudgetDetail(detail, sharedFilters)) return;
-        if (!matches(fAo, detail.ao_filter)) return;
-        if (!matches(fPo, detail.po_filter)) return;
-        if (!matches(fPtres, detail.ptres)) return;
-        if (!matches(fPi, detail.pi_filter)) return;
-        if (fNd.length && !fNd.some(value => (detail.nd_filter_values || [detail.nd_filter]).includes(value))) return;
-        details.push({
-          ...detail,
+        UnifiedData.budgetDetailPortions(detail, sharedFilters).forEach(portion => details.push({
+          ...portion,
           contrato: item.contrato
-        });
+        }));
       });
     });
     return details;
@@ -7948,16 +8615,21 @@ function Dashboard() {
       blo += r.v_bloqueado;
       can += r.v_cancelado;
       exe += r.v_executado;
-      if (!processedContracts.has(r.contrato)) {
-        processedContracts.add(r.contrato);
+      if (!processedContracts.has(UnifiedData.key(r.contrato))) {
+        processedContracts.add(UnifiedData.key(r.contrato));
         if (r.situacaoFlags.some(f => f.label === 'CAN')) qtdCancelados++;
         if (r.situacaoFlags.some(f => f.label === 'BLOQ')) qtdBloqueados++;
-        if (r.situacaoFlags.some(f => f.label.startsWith('ATIVO'))) {
+        if (ContractRules.phase(r) === 'vigente') {
           qtdAtivos++;
-          if (r.situacaoFlags.some(f => f.label === 'ATIVO INEXEC')) qtdAtivosInexec++;else if (r.situacaoFlags.some(f => f.label === 'ATIVO EM EXEC')) qtdAtivosEmExec++;else if (r.situacaoFlags.some(f => f.label === 'ATIVO EXEC TOT')) qtdAtivosExecTot++;else if (r.situacaoFlags.some(f => f.label === 'ATIVO EXEC PARC')) qtdAtivosExecParc++;
-        } else if (r.situacaoFlags.some(f => f.label.startsWith('VENC'))) {
+          if (r.situacaoFlags.some(f => f.label === 'VIG SEM EXEC')) qtdAtivosInexec++;
+          if (r.situacaoFlags.some(f => f.label === 'VIG EM EXEC')) qtdAtivosEmExec++;
+          if (r.situacaoFlags.some(f => f.label === 'VIG EXEC TOTAL')) qtdAtivosExecTot++;
+          if (r.situacaoFlags.some(f => f.label === 'VIG EXEC PARCIAL')) qtdAtivosExecParc++;
+        } else if (ContractRules.phase(r) === 'vencido') {
           qtdVencidos++;
-          if (r.situacaoFlags.some(f => f.label === 'VENC INEXEC TOT')) qtdVencInexecTot++;else if (r.situacaoFlags.some(f => f.label === 'VENC EXEC TOT')) qtdVencidosTot++;else if (r.situacaoFlags.some(f => f.label === 'VENC EXEC PARC')) qtdVencidosParc++;
+          if (r.situacaoFlags.some(f => f.label === 'VENC INEXEC TOTAL')) qtdVencInexecTot++;
+          if (r.situacaoFlags.some(f => f.label === 'VENC EXEC TOTAL')) qtdVencidosTot++;
+          if (r.situacaoFlags.some(f => f.label === 'VENC EXEC PARCIAL')) qtdVencidosParc++;
         }
       }
     });
@@ -8006,6 +8678,11 @@ function Dashboard() {
       pExe: emp ? exe / emp : 0
     };
   }, [filteredData]);
+  const loginSummary = useMemo(() => apiPayload && documentDashboard.ready ? ContractRules.loginSummary(rawData, documentDashboard.rawRows) : null, [apiPayload, rawData, documentDashboard.ready, documentDashboard.rawRows]);
+  const metadataConflictCount = useMemo(() => new Set(rawData.filter(row => {
+    var _row$contract_metadat;
+    return (_row$contract_metadat = row.contract_metadata_conflicts) === null || _row$contract_metadat === void 0 ? void 0 : _row$contract_metadat.length;
+  }).map(row => UnifiedData.key(row.contrato))).size, [rawData]);
   const getPersonData = (roleType, sortKey) => {
     const map = {};
     filteredData.forEach(item => {
@@ -8019,10 +8696,13 @@ function Dashboard() {
           emp_sub: 0,
           qtd_tit: 0,
           qtd_sub: 0,
+          contratos_tit: new Set(),
+          contratos_sub: new Set(),
           total: 0
         };
         map[tit].emp_tit += emp;
-        map[tit].qtd_tit += 1;
+        map[tit].contratos_tit.add(UnifiedData.key(item.contrato));
+        map[tit].qtd_tit = map[tit].contratos_tit.size;
         map[tit].total += emp;
       }
       if (sub && sub !== '-' && sub !== 'N/I') {
@@ -8032,10 +8712,13 @@ function Dashboard() {
           emp_sub: 0,
           qtd_tit: 0,
           qtd_sub: 0,
+          contratos_tit: new Set(),
+          contratos_sub: new Set(),
           total: 0
         };
         map[sub].emp_sub += emp;
-        map[sub].qtd_sub += 1;
+        map[sub].contratos_sub.add(UnifiedData.key(item.contrato));
+        map[sub].qtd_sub = map[sub].contratos_sub.size;
         map[sub].total += emp;
       }
     });
@@ -8053,11 +8736,12 @@ function Dashboard() {
       const rawDimension = item[key];
       let val = Array.isArray(rawDimension) ? rawDimension.length ? rawDimension.join(' / ') : "N/I" : rawDimension && rawDimension !== "-" ? rawDimension : "N/I";
       if (key === 'situacao') {
-        const mainTag = item.situacaoFlags.find(f => !['CAN', 'BLOQ'].includes(f.label));
+        const mainTag = ContractRules.primaryFlag(item.situacaoFlags);
         val = mainTag ? mainTag.label : val;
       }
       if (!map[val]) map[val] = {
         label: val,
+        contracts: new Set(),
         count: 0,
         total: 0,
         recebido: 0,
@@ -8070,7 +8754,8 @@ function Dashboard() {
         cancelado: 0,
         executado: 0
       };
-      map[val].count += 1;
+      map[val].contracts.add(UnifiedData.key(item.contrato));
+      map[val].count = map[val].contracts.size;
       map[val].total += item.v_empenhado;
       map[val].recebido += item.v_recebido || 0;
       map[val].a_receber += (item.v_empenhado || 0) - (item.v_recebido || 0);
@@ -8112,7 +8797,7 @@ function Dashboard() {
           executado: 0
         };
         const target = map[label];
-        target.contracts.add(detail.contrato);
+        target.contracts.add(UnifiedData.key(detail.contrato));
         target.descriptions.add(`${label} – ${dimensionName}`);
         target.total += (detail.v_empenhado || 0) * allocation;
         target.recebido += (detail.v_recebido || 0) * allocation;
@@ -8141,11 +8826,11 @@ function Dashboard() {
   const ndCodigoData = getOrcamentarioPieData('nd_codigo');
 
   // Gráficos Situação restritos a apenas as 7 TAGS
-  const allowedSitTags = ['ATIVO INEXEC', 'ATIVO EM EXEC', 'ATIVO EXEC TOT', 'ATIVO EXEC PARC', 'VENC INEXEC TOT', 'VENC EXEC TOT', 'VENC EXEC PARC'];
+  const allowedSitTags = ['VIG SEM EXEC', 'VIG EM EXEC', 'VIG EXEC TOTAL', 'VIG EXEC PARCIAL', 'VENC INEXEC TOTAL', 'VENC EXEC TOTAL', 'VENC EXEC PARCIAL'];
   const sitFilter = item => item.situacaoFlags.some(f => allowedSitTags.includes(f.label));
   const situacaoData = getPieDataFull('situacao', sitFilter);
   const getTop20Key = (item, mode) => {
-    if (mode === 'contrato') return item.contrato;
+    if (mode === 'contrato') return UnifiedData.key(item.contrato);
     if (mode === 'ano') return item.ano_vig_ini;
     if (mode === 'modalidade') return item.modalidade;
     if (mode === 'sec_log') return item.sec_log;
@@ -8214,6 +8899,12 @@ function Dashboard() {
   }, "MAIOR QTD"), /*#__PURE__*/React.createElement("option", {
     value: "nome_asc"
   }, "ORDEM A-Z"));
+  const commitmentData = useMemo(() => {
+    const knownContracts = new Set(rawData.map(row => UnifiedData.key(row.contrato)));
+    const selectedContracts = new Set(filteredData.map(row => UnifiedData.key(row.contrato)));
+    const rows = documentDashboard.filteredRows.filter(row => !knownContracts.has(UnifiedData.key(row.contrato)) || selectedContracts.has(UnifiedData.key(row.contrato)));
+    return UnifiedData.aggregateCommitments(rows);
+  }, [rawData, filteredData, documentDashboard.filteredRows]);
   const buildTop20Data = function (viewMode, sortKey) {
     let limit = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 20;
     const map = {};
@@ -8223,7 +8914,11 @@ function Dashboard() {
       pi_codigo: 'pi_codigo'
     };
     const budgetDimensionKey = budgetDimensionMap[viewMode];
-    if (budgetDimensionKey) {
+    if (viewMode === 'empenho') {
+      commitmentData.forEach(item => {
+        map[item.identity] = item;
+      });
+    } else if (budgetDimensionKey) {
       filteredOrcamentarioDetails.forEach(detail => {
         const rawKey = detail[budgetDimensionKey] || 'N/I';
         const keys = budgetDimensionKey === 'nd_codigo' ? splitBudgetDimensionValue(rawKey) : [rawKey];
@@ -8251,7 +8946,7 @@ function Dashboard() {
             fornecedor: ''
           };
           const target = map[key];
-          target.contracts.add(detail.contrato);
+          target.contracts.add(UnifiedData.key(detail.contrato));
           target.descriptions.add(`${key} – ${dimensionName}`);
           target.total += (detail.v_empenhado || 0) * allocation;
           target.recebido += (detail.v_recebido || 0) * allocation;
@@ -8268,7 +8963,7 @@ function Dashboard() {
       filteredData.forEach(item => {
         const key = getTop20Key(item, viewMode);
         if (!map[key]) map[key] = {
-          label: key,
+          label: viewMode === 'contrato' ? item.contrato : key,
           contracts: new Set(),
           global: 0,
           total: 0,
@@ -8284,7 +8979,7 @@ function Dashboard() {
           tooltip: key
         };
         const target = map[key];
-        target.contracts.add(item.contrato);
+        target.contracts.add(UnifiedData.key(item.contrato));
         target.global += item.v_global || 0;
         target.total += item.v_empenhado || 0;
         target.recebido += item.v_recebido || 0;
@@ -8314,17 +9009,33 @@ function Dashboard() {
     sortTop20Array(arr, sortKey);
     return limit === null ? arr : arr.slice(0, limit);
   };
-  const top20DataProcessed = useMemo(() => buildTop20Data(top20ViewMode, top20Sort), [filteredData, filteredOrcamentarioDetails, top20Sort, top20ViewMode]);
-  const top20100DataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort), [filteredData, filteredOrcamentarioDetails, top20100Sort, top20100ViewMode]);
-  const top20AllDataProcessed = useMemo(() => buildTop20Data(top20ViewMode, top20Sort, null), [filteredData, filteredOrcamentarioDetails, top20Sort, top20ViewMode]);
-  const top20100AllDataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort, null), [filteredData, filteredOrcamentarioDetails, top20100Sort, top20100ViewMode]);
+  const top20DataProcessed = useMemo(() => buildTop20Data(top20ViewMode, top20Sort), [filteredData, filteredOrcamentarioDetails, commitmentData, top20Sort, top20ViewMode]);
+  const top20100DataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort), [filteredData, filteredOrcamentarioDetails, commitmentData, top20100Sort, top20100ViewMode]);
+  const top20AllDataProcessed = useMemo(() => buildTop20Data(top20ViewMode, top20Sort, null), [filteredData, filteredOrcamentarioDetails, commitmentData, top20Sort, top20ViewMode]);
+  const top20100AllDataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort, null), [filteredData, filteredOrcamentarioDetails, commitmentData, top20100Sort, top20100ViewMode]);
   const contratoAllData = useMemo(() => {
-    let arr = [...filteredData];
-    if (contratoSort === 'valor_desc') arr.sort((a, b) => b.v_empenhado - a.v_empenhado);else if (contratoSort === 'exec_desc') arr.sort((a, b) => b.p_executado - a.p_executado);else if (contratoSort === 'tempo_desc') arr.sort((a, b) => b.perc_tempo - a.perc_tempo);else if (contratoSort === 'dias_asc') arr.sort((a, b) => {
-      let vA = a.encerrando_dias !== null ? a.encerrando_dias : 999999;
-      let vB = b.encerrando_dias !== null ? b.encerrando_dias : 999999;
-      return vA - vB;
-    });else if (contratoSort === 'nome_asc') arr.sort((a, b) => a.contrato.localeCompare(b.contrato));
+    const remaining = row => row.encerrando_dias === null || !Number.isFinite(row.encerrando_dias) ? null : row.encerrando_dias;
+    const arr = ContractRules.aggregateContracts(filteredData).map(row => ({
+      ...row,
+      p_recebido: row.v_empenhado ? (row.v_recebido || 0) / row.v_empenhado : 0,
+      p_liquidado: row.v_empenhado ? (row.v_liquidado || 0) / row.v_empenhado : 0,
+      p_pago: row.v_empenhado ? (row.v_pago || 0) / row.v_empenhado : 0
+    }));
+    arr.sort((a, b) => {
+      if (contratoSort === 'dias_asc' || contratoSort === 'dias_desc') {
+        const av = remaining(a),
+          bv = remaining(b);
+        if (av === null) return bv === null ? 0 : 1;
+        if (bv === null) return -1;
+        return (contratoSort === 'dias_asc' ? av - bv : bv - av) || a.contrato.localeCompare(b.contrato, 'pt-BR', {
+          numeric: true
+        });
+      }
+      const field = contratoSort === 'recebido_desc' ? 'p_recebido' : contratoSort === 'liquidado_desc' ? 'p_liquidado' : 'p_pago';
+      return (b[field] || 0) - (a[field] || 0) || a.contrato.localeCompare(b.contrato, 'pt-BR', {
+        numeric: true
+      });
+    });
     return arr;
   }, [filteredData, contratoSort]);
   const contratoChartData = useMemo(() => contratoAllData.slice(0, 20), [contratoAllData]);
@@ -8366,16 +9077,17 @@ function Dashboard() {
     });
   }, [filteredData]);
   const bubbleData = useMemo(() => {
+    const contracts = ContractRules.aggregateContracts(filteredData);
     let maxEmp = 0;
-    filteredData.forEach(d => {
+    contracts.forEach(d => {
       if (d.v_empenhado > maxEmp) maxEmp = d.v_empenhado;
     });
-    return filteredData.filter(d => {
-      const mainTag = d.situacaoFlags.find(f => !['CAN', 'BLOQ'].includes(f.label)) || d.situacaoFlags[0];
+    return contracts.filter(d => {
+      const mainTag = ContractRules.primaryFlag(d.situacaoFlags);
       const tagLabel = mainTag ? mainTag.label : 'OUTROS';
       return !scatterHiddenTags.includes(tagLabel);
     }).map(d => {
-      const mainTag = d.situacaoFlags.find(f => !['CAN', 'BLOQ'].includes(f.label)) || d.situacaoFlags[0];
+      const mainTag = ContractRules.primaryFlag(d.situacaoFlags);
       const hexColor = mainTag ? mainTag.hex : '#94a3b8';
       return {
         x: Math.min(Math.max((d[scatterXAxis] || 0) * 100, -10), 110),
@@ -8416,6 +9128,7 @@ function Dashboard() {
   const top20SubjectLabels = {
     fornecedor: 'FORNECEDOR',
     contrato: 'CONTRATO',
+    empenho: 'EMPENHO / CONTRATO / EMITENTE',
     ano: 'ANO',
     modalidade: 'MODALIDADE',
     sec_log: 'SEC LOG',
@@ -8492,6 +9205,18 @@ function Dashboard() {
     key: 'subject',
     align: 'left'
   }, {
+    header: 'CONTRATO',
+    key: 'contrato',
+    align: 'left'
+  }, {
+    header: 'EMPENHO',
+    key: 'empenho',
+    align: 'left'
+  }, {
+    header: 'EMITENTE',
+    key: 'ug',
+    align: 'left'
+  }, {
     header: 'QUANTIDADE',
     key: 'count'
   }, {
@@ -8534,10 +9259,22 @@ function Dashboard() {
     header: 'A PAGAR',
     key: 'a_pagar_table',
     isCurrency: true
-  }];
+  }].filter(column => top20ViewMode === 'empenho' || !['contrato', 'empenho', 'ug'].includes(column.key));
   const top20100TableColumns = [{
     header: top20SubjectLabels[top20100ViewMode],
     key: 'subject',
+    align: 'left'
+  }, {
+    header: 'CONTRATO',
+    key: 'contrato',
+    align: 'left'
+  }, {
+    header: 'EMPENHO',
+    key: 'empenho',
+    align: 'left'
+  }, {
+    header: 'EMITENTE',
+    key: 'ug',
     align: 'left'
   }, {
     header: 'QUANTIDADE',
@@ -8586,7 +9323,7 @@ function Dashboard() {
     header: 'A PAGAR %',
     key: 'p_a_pagar',
     isPercent: true
-  }];
+  }].filter(column => top20100ViewMode === 'empenho' || !['contrato', 'empenho', 'ug'].includes(column.key));
   const totalsByYear = dataByAno.reduce((totals, item) => ({
     iniciados: totals.iniciados + item.iniciados,
     encerrados: totals.encerrados + item.encerrados,
@@ -8660,36 +9397,27 @@ function Dashboard() {
     key: 'objeto',
     align: 'left'
   }, {
-    header: 'QUANTIDADE',
-    key: 'qtd_table',
-    format: () => 1
-  }, {
-    header: '% QTD',
-    key: 'pct_qtd',
-    isPercent: true
+    header: 'DIAS RESTANTES',
+    key: 'encerrando_dias'
   }, {
     header: '% TEMPO',
     key: 'perc_tempo',
     isPercent: true
   }, {
-    header: '% EXECUTADO',
-    key: 'p_executado',
+    header: 'VALOR EMPENHADO',
+    key: 'v_empenhado',
+    isCurrency: true
+  }, {
+    header: '% RECEBIDO',
+    key: 'p_recebido',
     isPercent: true
   }, {
     header: '% LIQUIDADO',
     key: 'p_liquidado',
     isPercent: true
   }, {
-    header: '% EXEC. LÍQUIDA',
+    header: '% PAGO',
     key: 'p_pago',
-    isPercent: true
-  }, {
-    header: 'EMPENHADO',
-    key: 'v_empenhado',
-    isCurrency: true
-  }, {
-    header: '% VALOR',
-    key: 'pct_valor',
     isPercent: true
   }];
   const scatterValueTotal = bubbleData.reduce((sum, item) => sum + item.v_empenhado, 0);
@@ -9035,15 +9763,21 @@ function Dashboard() {
   }), /*#__PURE__*/React.createElement("p", null, "A PROCESSAR LIGA\xC7\xC3O..."));
   return /*#__PURE__*/React.createElement("div", {
     className: "p-4 md:p-8 relative"
-  }, /*#__PURE__*/React.createElement("header", {
+  }, summaryRequested && loginSummary && /*#__PURE__*/React.createElement(LoginSummaryModal, {
+    summary: loginSummary,
+    user: currentUser,
+    onClose: closeSummary
+  }), /*#__PURE__*/React.createElement("header", {
     className: "max-w-[1600px] mx-auto mb-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
     className: "text-3xl font-black uppercase tracking-tighter text-slate-800"
-  }, "PAINEL GERAL DE CONTRATOS"), /*#__PURE__*/React.createElement("p", {
+  }, "PAINEL DE CONTRATOS"), /*#__PURE__*/React.createElement("p", {
     className: `text-[11px] font-bold mt-1 ${status.includes("Erro") || status.includes("falhou") || status.includes("Falha") ? "text-red-600" : "text-emerald-600"}`
   }, "\u25CF ", status), linkDiagnostics && (linkDiagnostics.ambiguos > 0 || linkDiagnostics.colunasAusentes) && /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-amber-700 mt-2"
-  }, linkDiagnostics.colunasAusentes ? "Classificação orçamentária indisponível: conferir cabeçalhos das fontes." : `${linkDiagnostics.ambiguos} registro(s) orçamentário(s) com vínculo ambíguo. Confira contrato e emitente na origem.`)), /*#__PURE__*/React.createElement("div", {
+  }, linkDiagnostics.colunasAusentes ? "Classificação orçamentária indisponível: conferir cabeçalhos das fontes." : `${linkDiagnostics.ambiguos} registro(s) orçamentário(s) com vínculo ambíguo. Confira contrato e emitente na origem.`), metadataConflictCount > 0 && /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-amber-700 mt-2"
+  }, metadataConflictCount, " contrato(s) com metadados divergentes na base geral. Vig\xEAncia e classifica\xE7\xE3o usam o primeiro registro; os saldos das linhas distintas foram somados.")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-3 items-center bg-white px-5 py-3 rounded-xl border border-slate-200 shadow-sm max-w-full"
   }, /*#__PURE__*/React.createElement(AccessMetadata, null), /*#__PURE__*/React.createElement("div", {
     className: "w-[1px] h-8 bg-slate-300 mx-1 hidden md:block shrink-0"
@@ -9065,15 +9799,15 @@ function Dashboard() {
   }, [{
     id: 1,
     label: 'PÁGINA 1',
-    detail: 'KPIs e Estatísticas'
+    detail: 'Estatísticas'
   }, {
     id: 2,
     label: 'PÁGINA 2',
-    detail: 'KPIs e Gráficos'
+    detail: 'Gráficos'
   }, {
     id: 3,
     label: 'PÁGINA 3',
-    detail: 'KPIs e Tabelas'
+    detail: 'Tabelas'
   }, {
     id: 4,
     label: 'PÁGINA 4',
@@ -9109,6 +9843,10 @@ function Dashboard() {
     onClick: toggleVigentes,
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVigentesActive ? 'bg-emerald-600 text-white border-emerald-600 ring-2 ring-emerald-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VIGENTES"), /*#__PURE__*/React.createElement("button", {
+    title: "Mostra todas as se\xE7\xF5es log\xEDsticas permitidas para seu usu\xE1rio, retirando somente o filtro SEC LOG. Os demais filtros continuam valendo.",
+    onClick: showCOLOG,
+    className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${fSecLog.length === 0 ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
+  }, "COLOG"), /*#__PURE__*/React.createElement("button", {
     title: QuickActionHelp.cSup(cSupItems),
     onClick: toggleCSup,
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isCSupActive ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
@@ -9116,7 +9854,7 @@ function Dashboard() {
     title: QuickActionHelp.outsideCSup,
     onClick: toggleNonCSup,
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isNonCSupActive ? 'bg-indigo-600 text-white border-indigo-600 ring-2 ring-indigo-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
-  }, "- C SUP"), /*#__PURE__*/React.createElement("button", {
+  }, "COLOG \u2013 C SUP"), /*#__PURE__*/React.createElement("button", {
     title: QuickActionHelp.clear,
     onClick: clearAllFilters,
     className: "text-[9px] font-bold uppercase bg-slate-800 text-white px-3 py-1.5 rounded hover:bg-slate-700 transition shadow-md border border-slate-800"
@@ -9148,8 +9886,8 @@ function Dashboard() {
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVencidos30Active ? 'bg-red-700 text-white border-red-700 ring-2 ring-red-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VENCIDOS H\xC1 30 DIAS")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
-  }, Object.entries(tagColorsMap).map(_ref32 => {
-    let [label, config] = _ref32;
+  }, Object.entries(tagColorsMap).map(_ref46 => {
+    let [label, config] = _ref46;
     const isActive = fSituacaoTags.includes(label);
     return /*#__PURE__*/React.createElement("button", {
       key: label,
@@ -9227,14 +9965,14 @@ function Dashboard() {
   })), documentDashboard.filters, /*#__PURE__*/React.createElement("h3", {
     className: "filter-subtitle"
   }, "Or\xE7amento"), /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-4"
-  }, "                    ", /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "AO NOME \u2013 C\xD3DIGO",
+    className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4"
+  }, /*#__PURE__*/React.createElement(MultiSelect, {
+    label: "AO C\xD3DIGO \u2013 NOME",
     options: filterOptions.ao_filter_values,
     selected: fAo,
     onChange: setFAo
   }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "PO NOME \u2013 C\xD3DIGO",
+    label: "PO C\xD3DIGO \u2013 NOME",
     options: filterOptions.po_filter_values,
     selected: fPo,
     onChange: setFPo
@@ -9249,63 +9987,40 @@ function Dashboard() {
     selected: fPi,
     onChange: setFPi
   }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "ND NOME \u2013 C\xD3DIGO",
-    options: filterOptions.nd_filter_values,
-    selected: fNd,
-    onChange: setFNd
+    label: "GRUPO C\xD3DIGO",
+    options: filterOptions.nd_grupo_values,
+    selected: fGrupo,
+    onChange: setFGrupo
   }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "AO C\xD3DIGO",
-    options: filterOptions.ao_codigo_values,
-    selected: fAoCodigo,
-    onChange: setFAoCodigo
+    label: "MODALIDADE C\xD3DIGO",
+    options: filterOptions.nd_modalidade_values,
+    selected: fNdModalidade,
+    onChange: setFNdModalidade
   }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "AO NOME",
-    options: filterOptions.ao_nome_values,
-    selected: fAoNome,
-    onChange: setFAoNome
+    label: "ELEMENTO C\xD3DIGO",
+    options: filterOptions.nd_elemento_values,
+    selected: fElemento,
+    onChange: setFElemento
   }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "PO C\xD3DIGO",
-    options: filterOptions.po_codigo_values,
-    selected: fPoCodigo,
-    onChange: setFPoCodigo
-  }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "PO NOME",
-    options: filterOptions.po_nome_values,
-    selected: fPoNome,
-    onChange: setFPoNome
-  }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "PI COD",
-    options: filterOptions.pi_cod_values,
-    selected: fPiCod,
-    onChange: setFPiCod
-  }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "PI NOME",
-    options: filterOptions.pi_nome_values,
-    selected: fPiNome,
-    onChange: setFPiNome
-  }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "ND C\xD3DIGO",
-    options: filterOptions.nd_codigo_values,
-    selected: fNdCodigo,
-    onChange: setFNdCodigo
-  }), /*#__PURE__*/React.createElement(MultiSelect, {
-    label: "ND NOME",
-    options: filterOptions.nd_nome_values,
-    selected: fNdNome,
-    onChange: setFNdNome
+    label: "SUBELEMENTO C\xD3DIGO \u2013 NOME",
+    options: filterOptions.nd_subelemento_filter_values,
+    selected: fSubelemento,
+    onChange: setFSubelemento
   })))), /*#__PURE__*/React.createElement("div", {
     className: "max-w-[1600px] mx-auto flex justify-end mb-3"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: toggleAllSections,
     className: "text-[11px] font-black text-white bg-slate-800 px-5 py-3 rounded-xl shadow-lg hover:bg-slate-700 transition uppercase tracking-wider"
   }, globalExpandState ? '▼ RECOLHER TODAS AS SEÇÕES' : '► EXPANDIR TODAS AS SEÇÕES')), /*#__PURE__*/React.createElement(CollapsibleSection, {
-    title: "INDICADORES DE DESEMPENHO (KPIs)",
+    title: "INDICADORES DE DESEMPENHO",
     defaultOpen: false,
     globalTrigger: expandTrigger,
     globalState: globalExpandState
   }, /*#__PURE__*/React.createElement("h3", {
     className: "filter-subtitle max-w-[1600px] mx-auto"
-  }, "Contratos"), /*#__PURE__*/React.createElement("div", {
+  }, "Contratos"), /*#__PURE__*/React.createElement("p", {
+    className: "max-w-[1600px] mx-auto mb-3 text-xs text-slate-500"
+  }, "As situa\xE7\xF5es de execu\xE7\xE3o s\xE3o exclusivas. CAN e BLOQ s\xE3o tags adicionais. As quantidades de vigentes e vencidos contam cada contrato uma \xFAnica vez."), /*#__PURE__*/React.createElement("div", {
     className: "max-w-[1600px] mx-auto grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 gap-4 mb-4"
   }, /*#__PURE__*/React.createElement(KPICard, {
     title: "QTD Contratos",
@@ -9314,15 +10029,15 @@ function Dashboard() {
     color: "slate",
     isCurrency: false
   }), /*#__PURE__*/React.createElement(KPICard, {
-    title: "QTD Ativos",
+    title: "QTD Vigentes",
     value: kpis.qtdAtivos,
-    extraText: `Inexec: ${kpis.qtdAtivosInexec}\nEm Exec: ${kpis.qtdAtivosEmExec}\nExec Tot: ${kpis.qtdAtivosExecTot}\nExec Parc: ${kpis.qtdAtivosExecParc}`,
+    extraText: `Sem exec: ${kpis.qtdAtivosInexec}\nEm Exec: ${kpis.qtdAtivosEmExec}\nExec Tot: ${kpis.qtdAtivosExecTot}\nExec Parc: ${kpis.qtdAtivosExecParc}`,
     color: "blue",
     isCurrency: false
   }), /*#__PURE__*/React.createElement(KPICard, {
     title: "QTD Vencidos",
     value: kpis.qtdVencidos,
-    extraText: `Inexec Tot: ${kpis.qtdVencInexecTot}\nExec Tot: ${kpis.qtdVencidosTot}\nExec Parc: ${kpis.qtdVencidosParc}`,
+    extraText: `Inexec total: ${kpis.qtdVencInexecTot}\nExec Tot: ${kpis.qtdVencidosTot}\nExec Parc: ${kpis.qtdVencidosParc}`,
     color: "slate",
     isCurrency: false
   }), /*#__PURE__*/React.createElement(KPICard, {
@@ -9914,6 +10629,8 @@ Substituto: ${kpis.qtdFiscaisSub}`,
   }, "VER POR FORNECEDOR"), /*#__PURE__*/React.createElement("option", {
     value: "contrato"
   }, "VER POR CONTRATO"), /*#__PURE__*/React.createElement("option", {
+    value: "empenho"
+  }, "VER POR EMPENHO"), /*#__PURE__*/React.createElement("option", {
     value: "ano"
   }, "VER POR ANO"), /*#__PURE__*/React.createElement("option", {
     value: "modalidade"
@@ -9939,6 +10656,8 @@ Substituto: ${kpis.qtdFiscaisSub}`,
   }) : /*#__PURE__*/React.createElement(ChartComponent, {
     id: "gTop20",
     type: "bar",
+    exportRows: top20TableRows.slice(0, 20),
+    exportColumns: top20TableColumns,
     data: {
       labels: top20DataProcessed.map(d => formatLabelMultiLine(top20ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label)),
       datasets: [{
@@ -10243,6 +10962,8 @@ Substituto: ${kpis.qtdFiscaisSub}`,
   }, "VER POR FORNECEDOR"), /*#__PURE__*/React.createElement("option", {
     value: "contrato"
   }, "VER POR CONTRATO"), /*#__PURE__*/React.createElement("option", {
+    value: "empenho"
+  }, "VER POR EMPENHO"), /*#__PURE__*/React.createElement("option", {
     value: "ano"
   }, "VER POR ANO"), /*#__PURE__*/React.createElement("option", {
     value: "modalidade"
@@ -10268,6 +10989,8 @@ Substituto: ${kpis.qtdFiscaisSub}`,
   }) : /*#__PURE__*/React.createElement(ChartComponent, {
     id: "gTop20100",
     type: "bar",
+    exportRows: top20100TableRows.slice(0, 20),
+    exportColumns: top20100TableColumns,
     data: {
       labels: top20100DataProcessed.map(d => formatLabelMultiLine(top20100ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label)),
       datasets: [{
@@ -10748,16 +11471,16 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     onChange: e => setContratoSort(e.target.value),
     className: "text-[10px] font-bold uppercase border border-slate-300 bg-slate-50 rounded px-2 py-1 outline-none"
   }, /*#__PURE__*/React.createElement("option", {
-    value: "valor_desc"
-  }, "Maior Valor"), /*#__PURE__*/React.createElement("option", {
-    value: "exec_desc"
-  }, "Maior Execu\xE7\xE3o"), /*#__PURE__*/React.createElement("option", {
-    value: "tempo_desc"
-  }, "Maior Tempo"), /*#__PURE__*/React.createElement("option", {
     value: "dias_asc"
-  }, "Menos Dias Restantes"), /*#__PURE__*/React.createElement("option", {
-    value: "nome_asc"
-  }, "Ordem Alfab\xE9tica")), /*#__PURE__*/React.createElement(ChartTableToggle, {
+  }, "Menos dias restantes"), /*#__PURE__*/React.createElement("option", {
+    value: "dias_desc"
+  }, "Mais dias restantes"), /*#__PURE__*/React.createElement("option", {
+    value: "recebido_desc"
+  }, "% Recebido"), /*#__PURE__*/React.createElement("option", {
+    value: "liquidado_desc"
+  }, "% Liquidado"), /*#__PURE__*/React.createElement("option", {
+    value: "pago_desc"
+  }, "% Pago")), /*#__PURE__*/React.createElement(ChartTableToggle, {
     isTable: chartTableViews.contrato,
     onToggle: () => toggleChartTableView('contrato')
   }))), /*#__PURE__*/React.createElement("div", {
@@ -10771,6 +11494,8 @@ Substituto: ${kpis.qtdFiscaisSub}`,
   }) : /*#__PURE__*/React.createElement(ChartComponent, {
     id: "gContrato",
     type: "bar",
+    exportRows: contractTableRows.slice(0, 20),
+    exportColumns: contractTableColumns,
     data: {
       labels: contratoChartData.map(d => formatLabelMultiLine(d.contrato)),
       datasets: [{
@@ -10796,9 +11521,9 @@ Substituto: ${kpis.qtdFiscaisSub}`,
           formatter: v => formatPercentBR(v)
         }
       }, {
-        label: '% Execução',
-        data: contratoChartData.map(d => d.p_executado),
-        backgroundColor: '#22c55e',
+        label: '% Recebido',
+        data: contratoChartData.map(d => d.p_recebido),
+        backgroundColor: '#8b5cf6',
         yAxisID: 'y_perc',
         borderRadius: 4,
         type: 'bar',
@@ -10840,9 +11565,9 @@ Substituto: ${kpis.qtdFiscaisSub}`,
           formatter: v => formatPercentBR(v)
         }
       }, {
-        label: '% Exec. Líquida',
+        label: '% Pago',
         data: contratoChartData.map(d => d.p_pago),
-        backgroundColor: '#8b5cf6',
+        backgroundColor: '#10b981',
         yAxisID: 'y_perc',
         borderRadius: 4,
         type: 'bar',
@@ -11683,7 +12408,7 @@ class ErrorBoundary extends React.Component {
       onClick: () => {
         clearAuthStorage();
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV2');
+        localStorage.removeItem('dashData_TotalV3');
         window.location.reload();
       },
       className: "bg-red-600 text-white px-6 py-3 rounded shadow font-bold hover:bg-red-700"
@@ -11717,16 +12442,17 @@ function App() {
         setIsLogging(false);
         return;
       }
-      sessionStorage.setItem('token_TotalV2', json.token);
-      sessionStorage.setItem('user_TotalV2', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
-      sessionStorage.setItem('perfil_TotalV2', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
-      sessionStorage.setItem('ativo_TotalV2', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
-      sessionStorage.setItem('validade_TotalV2', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
-      sessionStorage.setItem('duracao_diaria_horas_TotalV2', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
-      sessionStorage.setItem('expira_TotalV2', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
+      sessionStorage.setItem('token_TotalV3', json.token);
+      sessionStorage.setItem('summary_pending_TotalV3', '1');
+      sessionStorage.setItem('user_TotalV3', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
+      sessionStorage.setItem('perfil_TotalV3', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
+      sessionStorage.setItem('ativo_TotalV3', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
+      sessionStorage.setItem('validade_TotalV3', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
+      sessionStorage.setItem('duracao_diaria_horas_TotalV3', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
+      sessionStorage.setItem('expira_TotalV3', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
       try {
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV2');
+        localStorage.removeItem('dashData_TotalV3');
       } catch (e) {}
       setIsAuthenticated(true);
       setIsLogging(false);
@@ -11753,7 +12479,7 @@ function App() {
       className: "text-2xl font-black text-red-600 uppercase tracking-tighter leading-tight"
     }, "Acesso Restrito"), /*#__PURE__*/React.createElement("p", {
       className: "text-xs font-bold text-slate-500 mt-2 uppercase tracking-widest"
-    }, "Painel Geral de Contratos")), /*#__PURE__*/React.createElement("form", {
+    }, "Painel de Contratos")), /*#__PURE__*/React.createElement("form", {
       onSubmit: handleLogin,
       className: "space-y-5"
     }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
