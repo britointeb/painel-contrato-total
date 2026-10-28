@@ -419,21 +419,41 @@ const ContractRules = (() => {
   const loginSummary = function (contracts, documents) {
     let now = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : new Date();
     const period = bounds(now);
-    const unique = new Map();
-    (contracts || []).forEach(row => {
-      const id = UnifiedData.key(row.contrato);
-      if (id && row.contrato !== '-' && !unique.has(id)) unique.set(id, row);
-    });
-    const sections = new Map();
+    const authorizedDocuments = documents || [];
+    const canonicalContracts = aggregateContracts(contracts || []);
+    const contractSupplier = row => {
+      const metadata = row.contract_metadata || row;
+      const supplier = String(metadata.fornecedor || row.fornecedor || '').trim();
+      return {
+        contract: row.contrato,
+        supplier: supplier && supplier !== '-' ? supplier : 'N/I'
+      };
+    };
+    const suppliersByContract = new Map(canonicalContracts.map(row => [UnifiedData.key(row.contrato), contractSupplier(row)]));
+    const movementContracts = new Set(authorizedDocuments.filter(row => metrics.some(field => row[field.replace('v_', 'has_')])).map(row => UnifiedData.key(row.contrato)));
+    const sections = new Map(),
+      weekContracts = [],
+      next30Contracts = [];
     let totalCount = 0,
-      totalCents = 0,
-      weekCount = 0,
-      next30Count = 0;
-    unique.forEach(row => {
+      totalCents = 0;
+    canonicalContracts.forEach(row => {
       const metadata = row.contract_metadata || row;
       const end = midnight(metadata.dtFimVal || metadata.data_fim);
-      if (end !== null && end >= period.monday && end <= period.sunday) weekCount++;
-      if (end !== null && end >= period.today && end <= period.future30) next30Count++;
+      const inWeek = end !== null && end >= period.monday && end <= period.sunday;
+      const inNext30 = end !== null && end >= period.today && end <= period.future30;
+      if (inWeek || inNext30) {
+        const classification = classify(row, metadata, movementContracts.has(UnifiedData.key(row.contrato)), now);
+        const detail = {
+          id: UnifiedData.key(row.contrato),
+          ...contractSupplier(row),
+          value: cents(metadata.v_global) / 100,
+          endDate: end,
+          status: classification.labels.find(label => /^(VIG|VENC) /.test(label)) || 'N/I — sem classificação',
+          decorations: classification.labels.filter(label => label === 'CAN' || label === 'BLOQ')
+        };
+        if (inWeek) weekContracts.push(detail);
+        if (inNext30) next30Contracts.push(detail);
+      }
       if (phase(row, now) !== 'vigente') return;
       const section = metadata.sec_log && metadata.sec_log !== '-' ? metadata.sec_log : 'N/I';
       if (!sections.has(section)) sections.set(section, {
@@ -447,38 +467,78 @@ const ContractRules = (() => {
       totalCount++;
       totalCents += cents(metadata.v_global);
     });
+    const contractOrder = (a, b) => a.endDate - b.endDate || String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
+      numeric: true
+    });
+    weekContracts.sort(contractOrder);
+    next30Contracts.sort(contractOrder);
     const movements = {
-      pago: {
-        field: 'v_pago',
-        count: new Set(),
+      empenhado: {
+        field: 'v_empenhado',
+        documents: new Map(),
+        valueCents: 0
+      },
+      recebido: {
+        field: 'v_recebido',
+        documents: new Map(),
         valueCents: 0
       },
       liquidado: {
         field: 'v_liquidado',
-        count: new Set(),
+        documents: new Map(),
         valueCents: 0
       },
-      empenhado: {
-        field: 'v_empenhado',
-        count: new Set(),
+      pago: {
+        field: 'v_pago',
+        documents: new Map(),
         valueCents: 0
       }
     };
-    (documents || []).forEach(row => {
+    authorizedDocuments.forEach(row => {
       const day = midnight(row.diaVal || row.dia);
       if (day === null || day < period.recent7 || day > period.today || !row.documento || row.documento === '-') return;
       Object.values(movements).forEach(target => {
         if (!row[target.field.replace('v_', 'has_')]) return;
-        target.count.add(UnifiedData.documentId(row));
-        target.valueCents += cents(row[target.field]);
+        const id = UnifiedData.documentId(row);
+        if (!target.documents.has(id)) target.documents.set(id, {
+          id,
+          document: row.documento,
+          ug: row.ug || 'N/I',
+          valueCents: 0,
+          dateValues: new Set(),
+          contractSuppliers: new Map(),
+          contractBeneficiaries: new Map()
+        });
+        const detail = target.documents.get(id),
+          value = cents(row[target.field]);
+        const contractKey = UnifiedData.key(row.contrato),
+          contractNumber = String(row.contrato || '').trim();
+        if (!detail.contractSuppliers.has(contractKey)) detail.contractSuppliers.set(contractKey, suppliersByContract.get(contractKey) || {
+          contract: contractNumber && contractNumber !== '-' ? contractNumber : 'N/I',
+          supplier: 'N/I'
+        });
+        if (target.field === 'v_recebido') {
+          const name = String(row.favorecido || '').trim();
+          const beneficiary = name && name !== '-' ? name : 'N/I';
+          const pairKey = `${contractKey}|${UnifiedData.normalize(beneficiary)}|${UnifiedData.key(row.favorecido_cnpj)}`;
+          if (!detail.contractBeneficiaries.has(pairKey)) detail.contractBeneficiaries.set(pairKey, {
+            contract: detail.contractSuppliers.get(contractKey).contract,
+            beneficiary
+          });
+        }
+        detail.valueCents += value;
+        detail.dateValues.add(day);
+        target.valueCents += value;
       });
     });
     return {
       period,
       totalCount,
       totalValue: totalCents / 100,
-      weekCount,
-      next30Count,
+      weekCount: weekContracts.length,
+      next30Count: next30Contracts.length,
+      weekContracts,
+      next30Contracts,
       sections: [...sections.values()].sort((a, b) => a.section.localeCompare(b.section, 'pt-BR')).map(row => ({
         section: row.section,
         count: row.count,
@@ -487,8 +547,29 @@ const ContractRules = (() => {
       movements: Object.fromEntries(Object.entries(movements).map(_ref4 => {
         let [name, row] = _ref4;
         return [name, {
-          count: row.count.size,
-          value: row.valueCents / 100
+          count: row.documents.size,
+          value: row.valueCents / 100,
+          documents: [...row.documents.values()].map(detail => {
+            const dateValues = [...detail.dateValues].sort((a, b) => a - b),
+              dates = dateValues.map(formatDate);
+            return {
+              id: detail.id,
+              document: detail.document,
+              ug: detail.ug,
+              value: detail.valueCents / 100,
+              date: dates.join('; '),
+              dates,
+              dateValue: dateValues[dateValues.length - 1],
+              contractSuppliers: [...detail.contractSuppliers.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
+                numeric: true
+              })),
+              contractBeneficiaries: [...detail.contractBeneficiaries.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
+                numeric: true
+              }) || a.beneficiary.localeCompare(b.beneficiary, 'pt-BR'))
+            };
+          }).sort((a, b) => b.dateValue - a.dateValue || String(a.document).localeCompare(String(b.document), 'pt-BR', {
+            numeric: true
+          }) || String(a.ug).localeCompare(String(b.ug), 'pt-BR'))
         }];
       }))
     };
@@ -520,17 +601,34 @@ function LoginSummaryModal(_ref5) {
     user,
     onClose
   } = _ref5;
-  const closeRef = useRef(null);
+  const closeRef = useRef(null),
+    dialogRef = useRef(null);
   useEffect(() => {
     var _closeRef$current;
     const previous = document.activeElement;
     (_closeRef$current = closeRef.current) === null || _closeRef$current === void 0 || _closeRef$current.focus();
     const keydown = event => {
-      if (event.key === 'Escape') onClose();
-      if (event.key === 'Tab') {
+      var _dialogRef$current, _dialogRef$current2, _dialogRef$current3;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(((_dialogRef$current = dialogRef.current) === null || _dialogRef$current === void 0 ? void 0 : _dialogRef$current.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')) || []).filter(element => !element.disabled && element.getAttribute('aria-hidden') !== 'true');
+      const first = focusable[0],
+        last = focusable[focusable.length - 1];
+      if (!first) {
         var _closeRef$current2;
         event.preventDefault();
         (_closeRef$current2 = closeRef.current) === null || _closeRef$current2 === void 0 || _closeRef$current2.focus();
+        return;
+      }
+      if (event.shiftKey && (document.activeElement === first || !((_dialogRef$current2 = dialogRef.current) !== null && _dialogRef$current2 !== void 0 && _dialogRef$current2.contains(document.activeElement)))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !((_dialogRef$current3 = dialogRef.current) !== null && _dialogRef$current3 !== void 0 && _dialogRef$current3.contains(document.activeElement)))) {
+        event.preventDefault();
+        first.focus();
       }
     };
     document.addEventListener('keydown', keydown);
@@ -545,13 +643,56 @@ function LoginSummaryModal(_ref5) {
   }, [onClose]);
   if (!summary) return null;
   const p = summary.period;
+  const contractList = (items, label) => !(items !== null && items !== void 0 && items.length) ? /*#__PURE__*/React.createElement("p", {
+    className: "mt-3 text-sm text-slate-500"
+  }, "Nenhum contrato neste per\xEDodo.") : /*#__PURE__*/React.createElement("div", {
+    role: "region",
+    "aria-label": label,
+    tabIndex: 0,
+    className: "mt-3 max-h-60 overflow-y-auto rounded-lg border border-slate-100 p-2 outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+  }, /*#__PURE__*/React.createElement("ul", {
+    className: "space-y-3 text-sm text-slate-700"
+  }, items.map(row => {
+    var _row$decorations;
+    return /*#__PURE__*/React.createElement("li", {
+      key: row.id,
+      className: "break-words border-b border-slate-100 pb-3 last:border-0 last:pb-0"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "font-bold"
+    }, row.contract), ' – ', row.supplier, ' – ', /*#__PURE__*/React.createElement("span", {
+      className: "tabular-nums"
+    }, formatBRL(row.value)), ' – ', /*#__PURE__*/React.createElement("span", {
+      className: "font-semibold"
+    }, row.status), ((_row$decorations = row.decorations) === null || _row$decorations === void 0 ? void 0 : _row$decorations.length) > 0 && /*#__PURE__*/React.createElement("span", {
+      className: "ml-1 text-xs text-slate-500"
+    }, "(", row.decorations.join(' · '), ")"));
+  })));
+  const documentList = (items, label, metric) => !(items !== null && items !== void 0 && items.length) ? /*#__PURE__*/React.createElement("p", {
+    className: "mt-3 text-sm text-slate-500"
+  }, "Nenhum documento neste per\xEDodo.") : /*#__PURE__*/React.createElement("div", {
+    role: "region",
+    "aria-label": `Documentos ${label.toLowerCase()}`,
+    tabIndex: 0,
+    className: "mt-3 max-h-60 overflow-y-auto rounded-lg border border-slate-100 p-2 outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+  }, /*#__PURE__*/React.createElement("ul", {
+    className: "space-y-2 text-[11px] leading-relaxed text-slate-700"
+  }, items.map(row => /*#__PURE__*/React.createElement("li", {
+    key: row.id,
+    title: `UG ${row.ug} · Datas: ${row.date}`,
+    className: "break-words border-b border-slate-100 pb-2 last:border-0 last:pb-0"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "font-bold"
+  }, row.document), ' – ', /*#__PURE__*/React.createElement("span", {
+    className: "tabular-nums"
+  }, formatBRL(row.value)), ' – ', metric === 'recebido' ? row.contractBeneficiaries.map(pair => `${pair.contract} – ${pair.beneficiary}`).join('; ') : row.contractSuppliers.map(pair => `${pair.contract} – ${pair.supplier}`).join('; '), ' – ', row.date))));
   return /*#__PURE__*/React.createElement("div", {
     className: "fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 p-3 md:p-6"
   }, /*#__PURE__*/React.createElement("section", {
+    ref: dialogRef,
     role: "dialog",
     "aria-modal": "true",
     "aria-labelledby": "login-summary-title",
-    className: "max-h-[92vh] w-full max-w-4xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl md:p-8"
+    className: "max-h-[92vh] w-full max-w-5xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl md:p-8"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mb-5 flex items-start justify-between gap-4"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
@@ -602,40 +743,43 @@ function LoginSummaryModal(_ref5) {
   }, formatBRL(summary.totalValue)))))), /*#__PURE__*/React.createElement("div", {
     className: "my-5 grid gap-3 sm:grid-cols-2"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "rounded-xl border border-slate-200 p-4"
+    className: "min-w-0 rounded-xl border border-slate-200 p-4"
   }, /*#__PURE__*/React.createElement("h3", {
     className: "text-sm font-bold text-slate-700"
   }, "Vencendo nesta semana"), /*#__PURE__*/React.createElement("p", {
     className: "mt-1 text-xs text-slate-500"
   }, "Segunda a domingo: ", ContractRules.formatDate(p.monday), " a ", ContractRules.formatDate(p.sunday)), /*#__PURE__*/React.createElement("p", {
     className: "mt-2 text-2xl font-black text-blue-700"
-  }, summary.weekCount.toLocaleString('pt-BR'), " contratos")), /*#__PURE__*/React.createElement("div", {
-    className: "rounded-xl border border-slate-200 p-4"
+  }, summary.weekCount.toLocaleString('pt-BR'), " contratos"), contractList(summary.weekContracts, 'Contratos vencendo nesta semana')), /*#__PURE__*/React.createElement("div", {
+    className: "min-w-0 rounded-xl border border-slate-200 p-4"
   }, /*#__PURE__*/React.createElement("h3", {
     className: "text-sm font-bold text-slate-700"
   }, "Vencendo nos pr\xF3ximos 30 dias"), /*#__PURE__*/React.createElement("p", {
     className: "mt-1 text-xs text-slate-500"
   }, "De ", ContractRules.formatDate(p.today), " a ", ContractRules.formatDate(p.future30), ", inclusive"), /*#__PURE__*/React.createElement("p", {
     className: "mt-2 text-2xl font-black text-blue-700"
-  }, summary.next30Count.toLocaleString('pt-BR'), " contratos"))), /*#__PURE__*/React.createElement("h3", {
+  }, summary.next30Count.toLocaleString('pt-BR'), " contratos"), contractList(summary.next30Contracts, 'Contratos vencendo nos próximos 30 dias'))), /*#__PURE__*/React.createElement("h3", {
     className: "mb-1 text-sm font-black uppercase text-slate-700"
   }, "\xDAltimas movimenta\xE7\xF5es dos 7 dias"), /*#__PURE__*/React.createElement("p", {
     className: "mb-3 text-xs text-slate-500"
   }, ContractRules.formatDate(p.recent7), " a ", ContractRules.formatDate(p.today), ", inclusive. Valores dos lan\xE7amentos do per\xEDodo."), /*#__PURE__*/React.createElement("div", {
-    className: "grid gap-3 sm:grid-cols-3"
-  }, [['pago', 'Pagos'], ['liquidado', 'Liquidados'], ['empenhado', 'Empenhados']].map(_ref6 => {
+    className: "grid gap-3 sm:grid-cols-2 xl:grid-cols-4"
+  }, [['empenhado', 'Empenhados'], ['recebido', 'Recebidos'], ['liquidado', 'Liquidados'], ['pago', 'Pagos']].map(_ref6 => {
     let [metric, label] = _ref6;
     return /*#__PURE__*/React.createElement("div", {
       key: metric,
-      className: "rounded-xl border-t-4 border border-slate-200 p-4",
-      style: MetricColors.cardStyle(metric)
+      className: "min-w-0 rounded-xl border-t-4 border border-slate-200 p-4",
+      style: metric === 'recebido' ? {
+        borderTopColor: '#8b5cf6',
+        color: '#6d28d9'
+      } : MetricColors.cardStyle(metric)
     }, /*#__PURE__*/React.createElement("h4", {
       className: "text-sm font-bold"
     }, label), /*#__PURE__*/React.createElement("p", {
-      className: "mt-2 text-lg font-black"
+      className: "mt-2 break-words text-lg font-black"
     }, formatBRL(summary.movements[metric].value)), /*#__PURE__*/React.createElement("p", {
       className: "mt-1 text-xs text-slate-500"
-    }, summary.movements[metric].count.toLocaleString('pt-BR'), " documentos"));
+    }, summary.movements[metric].count.toLocaleString('pt-BR'), " documentos"), documentList(summary.movements[metric].documents, label, metric));
   }))));
 }
 
@@ -744,7 +888,7 @@ const MetricColors = (() => {
   };
   const chartData = (data, chartType) => {
     if (!data || !data.datasets) return data;
-    return {
+    const colored = {
       ...data,
       datasets: data.datasets.map(dataset => {
         const metric = key(dataset.label);
@@ -787,6 +931,23 @@ const MetricColors = (() => {
           if (dataset.pointBorderColor !== undefined) result.pointBorderColor = color;
           if (dataset.hoverBackgroundColor !== undefined) result.hoverBackgroundColor = color;
         }
+        return result;
+      })
+    };
+    const others = (data.labels || []).map(label => normalize(Array.isArray(label) ? label.join(' ') : label) === 'outros');
+    if (!others.some(Boolean)) return colored;
+    return {
+      ...colored,
+      datasets: colored.datasets.map(dataset => {
+        if ((dataset.type || chartType) !== 'bar') return dataset;
+        const result = {
+          ...dataset
+        };
+        ['backgroundColor', 'borderColor', 'hoverBackgroundColor', 'hoverBorderColor'].forEach(property => {
+          const original = dataset[property];
+          if (original === undefined && property !== 'backgroundColor') return;
+          result[property] = typeof original === 'function' ? context => others[context.dataIndex] ? '#94a3b8' : original(context) : others.map((isOther, index) => isOther ? '#94a3b8' : Array.isArray(original) ? original[index] : original);
+        });
         return result;
       })
     };
@@ -1076,9 +1237,9 @@ const normalizeStr = str => {
 
 // Implantação V1_GPT, compatível com o Code.gs orçamentário por documento CCor.
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwDf4gT-FPusNrbuXS0t-dE-LCLmqXmMVG7QX34GuQUHWc3EwjEargr1Mdi4DeXwpxf/exec";
-const DASH_CACHE_KEY = 'dashData_TotalV3_total_v3';
-const DASH_VERSION = 'V3';
-const AUTH_STORAGE_KEYS = ['summary_pending_TotalV3', 'token_TotalV3', 'user_TotalV3', 'perfil_TotalV3', 'ativo_TotalV3', 'validade_TotalV3', 'duracao_diaria_horas_TotalV3', 'expira_TotalV3'];
+const DASH_CACHE_KEY = 'dashData_TotalV4_total_v4';
+const DASH_VERSION = 'V4';
+const AUTH_STORAGE_KEYS = ['summary_pending_TotalV4', 'token_TotalV4', 'user_TotalV4', 'perfil_TotalV4', 'ativo_TotalV4', 'validade_TotalV4', 'duracao_diaria_horas_TotalV4', 'expira_TotalV4'];
 const clearAuthStorage = () => {
   try {
     AUTH_STORAGE_KEYS.forEach(key => sessionStorage.removeItem(key));
@@ -1086,9 +1247,9 @@ const clearAuthStorage = () => {
 };
 const isAuthSessionValid = () => {
   try {
-    const token = sessionStorage.getItem('token_TotalV3');
+    const token = sessionStorage.getItem('token_TotalV4');
     if (!token) return false;
-    const expiraEm = Number(sessionStorage.getItem('expira_TotalV3') || 0);
+    const expiraEm = Number(sessionStorage.getItem('expira_TotalV4') || 0);
     if (expiraEm && Date.now() > expiraEm) {
       clearAuthStorage();
       return false;
@@ -1136,11 +1297,33 @@ const splitBudgetDimensionValue = value => {
   if (!normalized || normalized === '-') return [];
   return [...new Set(normalized.split(/\s*;\s*/).map(item => item.trim()).filter(Boolean))];
 };
-const getFornecedorCnpj = fornecedor => {
-  const identifier = String(fornecedor || '').split(/\s+-\s+/)[0];
-  const digits = identifier.replace(/\D/g, '');
-  return digits.length >= 14 ? digits.slice(0, 14) : '';
+const getFornecedorCnpj = value => {
+  const text = String(value ?? '').trim();
+  const identifiers = new Set();
+  const pattern = /(?:^|[^A-Za-z0-9])((?:\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}|\d{14}))(?=$|[^A-Za-z0-9])/g;
+  let match;
+  while (match = pattern.exec(text)) identifiers.add(match[1].replace(/\D/g, ''));
+  return identifiers.size === 1 ? [...identifiers][0] : '';
 };
+const counterpartyUrl = (name, identifier) => {
+  const cnpj = getFornecedorCnpj(name) || getFornecedorCnpj(identifier);
+  return cnpj ? 'https://portaldatransparencia.gov.br/pessoa-juridica/' + cnpj : '';
+};
+function CounterpartyLink(_ref7) {
+  let {
+    name,
+    identifier,
+    title = 'Abrir pessoa jurídica no Portal da Transparência'
+  } = _ref7;
+  const href = counterpartyUrl(name, identifier);
+  return href ? /*#__PURE__*/React.createElement("a", {
+    href: href,
+    target: "_blank",
+    rel: "noopener noreferrer",
+    className: "text-blue-700 hover:text-blue-900 hover:underline",
+    title: title
+  }, name) : /*#__PURE__*/React.createElement("span", null, name);
+}
 const shortenNumber = num => {
   if (!num) return "0";
   if (num >= 1e9) return (num / 1e9).toFixed(1).replace('.', ',') + ' Bi';
@@ -1193,6 +1376,200 @@ const formatExportCell = (row, column) => {
   if (column.isCurrency) return formatBRL(value);
   return value;
 };
+
+// Export-only typography and callouts for the page-one statistics cards.
+const StatisticsPng = (() => {
+  const applies = config => /^(?:pie|bar)-/.test((config === null || config === void 0 ? void 0 : config.exportId) || '') || ['gGestor', 'gFiscal'].includes(config === null || config === void 0 ? void 0 : config.exportId);
+  const minimumHeight = (config, width) => {
+    var _config$options, _config$data;
+    return ((_config$options = config.options) === null || _config$options === void 0 ? void 0 : _config$options.indexAxis) === 'y' ? Math.ceil(Math.max(width * .75, ((((_config$data = config.data) === null || _config$data === void 0 || (_config$data = _config$data.labels) === null || _config$data === void 0 ? void 0 : _config$data.length) || 1) * 104 + 400) * width / 1600)) : Math.ceil(width * .75);
+  };
+  const distribute = (items, minY, maxY, gap) => {
+    const ordered = items.map(item => ({
+      ...item
+    })).sort((a, b) => a.desiredY - b.desiredY);
+    if (!ordered.length) return ordered;
+    ordered.forEach((item, index) => {
+      item.y = Math.max(item.desiredY, index ? ordered[index - 1].y + gap : minY);
+    });
+    if (ordered[ordered.length - 1].y > maxY) {
+      ordered[ordered.length - 1].y = maxY;
+      for (let index = ordered.length - 2; index >= 0; index--) ordered[index].y = Math.min(ordered[index].y, ordered[index + 1].y - gap);
+    }
+    if (ordered[0].y < minY) ordered.forEach((item, index) => {
+      item.y = minY + index * gap;
+    });
+    return ordered;
+  };
+  const configure = (input, width) => {
+    var _plugins$legend, _plugins$legend2, _input$data;
+    const unit = width / 1600;
+    const font = function (value) {
+      let minimum = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 24;
+      return typeof value === 'function' ? context => font(value(context), minimum) : {
+        ...(value || {}),
+        size: Math.ceil(Math.max(minimum, (Number(value === null || value === void 0 ? void 0 : value.size) || 12) * 2.5) * unit)
+      };
+    };
+    const labelsOptions = value => value === false ? false : {
+      ...(value || {}),
+      font: font(value === null || value === void 0 ? void 0 : value.font, 26),
+      offset: Math.ceil(Math.max(8, Number((value === null || value === void 0 ? void 0 : value.offset) || 0) * 2.5) * unit),
+      clip: false,
+      clamp: true
+    };
+    const original = input.options || {},
+      plugins = original.plugins || {};
+    const pie = input.type === 'pie' || input.type === 'doughnut';
+    const datalabels = labelsOptions(plugins.datalabels);
+    const legend = plugins.legend === false ? false : {
+      ...plugins.legend,
+      labels: {
+        ...((_plugins$legend = plugins.legend) === null || _plugins$legend === void 0 ? void 0 : _plugins$legend.labels),
+        font: font((_plugins$legend2 = plugins.legend) === null || _plugins$legend2 === void 0 || (_plugins$legend2 = _plugins$legend2.labels) === null || _plugins$legend2 === void 0 ? void 0 : _plugins$legend2.font, 26),
+        boxWidth: Math.ceil(20 * unit),
+        boxHeight: Math.ceil(20 * unit),
+        padding: Math.ceil(18 * unit)
+      }
+    };
+    const config = {
+      ...input,
+      options: {
+        ...original,
+        responsive: false,
+        maintainAspectRatio: false,
+        animation: false,
+        devicePixelRatio: 1,
+        font: font(original.font),
+        layout: {
+          ...original.layout,
+          padding: pie ? {
+            top: Math.ceil(80 * unit),
+            right: Math.ceil(240 * unit),
+            bottom: Math.ceil(75 * unit),
+            left: Math.ceil(240 * unit)
+          } : {
+            top: Math.ceil(130 * unit),
+            right: Math.ceil(75 * unit),
+            bottom: Math.ceil(110 * unit),
+            left: Math.ceil(90 * unit)
+          }
+        },
+        plugins: {
+          ...plugins,
+          legend,
+          datalabels: pie ? false : datalabels,
+          ...(pie ? {
+            pieLinePlugin: false
+          } : {})
+        },
+        scales: original.scales ? Object.fromEntries(Object.entries(original.scales).map(_ref8 => {
+          var _scale$ticks, _scale$title;
+          let [key, scale] = _ref8;
+          return [key, {
+            ...scale,
+            ticks: {
+              ...scale.ticks,
+              font: font((_scale$ticks = scale.ticks) === null || _scale$ticks === void 0 ? void 0 : _scale$ticks.font),
+              padding: Math.ceil(8 * unit)
+            },
+            title: {
+              ...scale.title,
+              font: font((_scale$title = scale.title) === null || _scale$title === void 0 ? void 0 : _scale$title.font, 26)
+            }
+          }];
+        })) : undefined
+      },
+      data: {
+        ...input.data,
+        datasets: (((_input$data = input.data) === null || _input$data === void 0 ? void 0 : _input$data.datasets) || []).map(dataset => ({
+          ...dataset,
+          ...(dataset.datalabels !== undefined ? {
+            datalabels: pie ? false : labelsOptions(dataset.datalabels)
+          } : {})
+        }))
+      }
+    };
+    if (pie && plugins.datalabels !== false) config.plugins = [...(input.plugins || []), {
+      id: 'statisticsExportLabels',
+      afterDatasetsDraw(chart) {
+        var _meta$data;
+        if (chart.isDatasetVisible && !chart.isDatasetVisible(0)) return;
+        const dataset = chart.data.datasets[0],
+          meta = chart.getDatasetMeta(0),
+          ctx = chart.ctx;
+        if (!dataset || !(meta !== null && meta !== void 0 && (_meta$data = meta.data) !== null && _meta$data !== void 0 && _meta$data.length)) return;
+        const sides = {
+          left: [],
+          right: []
+        };
+        const annotationFont = typeof datalabels.font === 'function' ? datalabels.font({
+          chart,
+          dataset,
+          datasetIndex: 0,
+          dataIndex: 0
+        }) : datalabels.font;
+        const size = annotationFont.size,
+          lineHeight = Math.ceil(size * 1.2),
+          gap = lineHeight * 2 + Math.ceil(16 * unit);
+        const top = chart.chartArea.top + lineHeight,
+          bottom = chart.chartArea.bottom - lineHeight;
+        meta.data.forEach((arc, dataIndex) => {
+          const value = dataset.data[dataIndex];
+          if (!Number(value) || chart.getDataVisibility && !chart.getDataVisibility(dataIndex)) return;
+          const context = {
+            chart,
+            dataset,
+            dataIndex,
+            datasetIndex: 0,
+            active: false
+          };
+          const formatted = typeof datalabels.formatter === 'function' ? datalabels.formatter(value, context) : value;
+          const lines = Array.isArray(formatted) ? formatted.map(String) : String(formatted ?? '').split('\n');
+          if (!lines.some(Boolean)) return;
+          const angle = (arc.startAngle + arc.endAngle) / 2,
+            side = Math.cos(angle) < 0 ? 'left' : 'right';
+          const sign = side === 'left' ? -1 : 1;
+          sides[side].push({
+            lines,
+            desiredY: arc.y + Math.sin(angle) * (arc.outerRadius + 25 * unit),
+            startX: arc.x + Math.cos(angle) * arc.outerRadius,
+            startY: arc.y + Math.sin(angle) * arc.outerRadius,
+            elbowX: arc.x + sign * (arc.outerRadius + 25 * unit),
+            textX: side === 'left' ? chart.chartArea.left - 35 * unit : chart.chartArea.right + 35 * unit
+          });
+        });
+        ctx.save();
+        ctx.font = `${annotationFont.weight || 'bold'} ${size}px ${annotationFont.family || 'Outfit, Arial, sans-serif'}`;
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = datalabels.color || '#334155';
+        ctx.strokeStyle = '#94a3b8';
+        ctx.lineWidth = 1.5 * unit;
+        Object.entries(sides).forEach(_ref9 => {
+          let [side, items] = _ref9;
+          return distribute(items, top, bottom, Math.min(gap, items.length > 1 ? (bottom - top) / (items.length - 1) : gap)).forEach(item => {
+            const sign = side === 'left' ? -1 : 1;
+            ctx.beginPath();
+            ctx.moveTo(item.startX, item.startY);
+            ctx.lineTo(item.elbowX, item.y);
+            ctx.lineTo(item.textX - sign * 10 * unit, item.y);
+            ctx.stroke();
+            ctx.textAlign = side === 'left' ? 'right' : 'left';
+            item.lines.forEach((line, index) => ctx.fillText(line, item.textX, item.y + (index - (item.lines.length - 1) / 2) * lineHeight));
+          });
+        });
+        ctx.restore();
+      }
+    }];
+    return config;
+  };
+  return Object.freeze({
+    applies,
+    minimumHeight,
+    configure,
+    distribute
+  });
+})();
 const ExportData = (() => {
   const numeric = value => typeof value === 'number' && Number.isFinite(value);
   const joinedLabel = value => Array.isArray(value) ? value.join(' ') : String(value == null ? '' : value);
@@ -1222,28 +1599,28 @@ const ExportData = (() => {
     const datasets = ((data === null || data === void 0 ? void 0 : data.datasets) || []).map((dataset, index) => ({
       dataset,
       index
-    })).filter(_ref7 => {
+    })).filter(_ref10 => {
       let {
         dataset,
         index
-      } = _ref7;
+      } = _ref10;
       return dataset.hidden !== true && (!(chart !== null && chart !== void 0 && chart.isDatasetVisible) || chart.isDatasetVisible(index));
     });
     const visiblePoint = index => !(type === 'pie' || type === 'doughnut') || !(chart !== null && chart !== void 0 && chart.getDataVisibility) || chart.getDataVisibility(index);
-    const objectData = datasets.some(_ref8 => {
+    const objectData = datasets.some(_ref11 => {
       let {
         dataset
-      } = _ref8;
+      } = _ref11;
       return (dataset.data || []).some(point => point && typeof point === 'object' && !Array.isArray(point));
     });
     if (objectData) {
       const rows = [],
         keys = new Set();
-      datasets.forEach(_ref9 => {
+      datasets.forEach(_ref12 => {
         let {
           dataset,
           index
-        } = _ref9;
+        } = _ref12;
         return (dataset.data || []).forEach((point, pointIndex) => {
           if (!visiblePoint(pointIndex) || !point || typeof point !== 'object') return;
           const contractPoint = Object.prototype.hasOwnProperty.call(point, 'contrato') || Object.prototype.hasOwnProperty.call(point, 'v_empenhado');
@@ -1264,10 +1641,10 @@ const ExportData = (() => {
           rows.push(row);
         });
       });
-      const monetaryY = datasets.every(_ref10 => {
+      const monetaryY = datasets.every(_ref13 => {
         let {
           dataset
-        } = _ref10;
+        } = _ref13;
         return moneySeries(dataset.label || '');
       });
       return {
@@ -1288,12 +1665,12 @@ const ExportData = (() => {
       const row = {
         subject: joinedLabel(label)
       };
-      datasets.forEach(_ref11 => {
+      datasets.forEach(_ref14 => {
         var _dataset$data;
         let {
           dataset,
           index: datasetIndex
-        } = _ref11;
+        } = _ref14;
         row[`dataset_${datasetIndex}`] = ((_dataset$data = dataset.data) === null || _dataset$data === void 0 ? void 0 : _dataset$data[index]) ?? null;
       });
       return [row];
@@ -1301,11 +1678,11 @@ const ExportData = (() => {
     const columns = [{
       header: 'ASSUNTO',
       key: 'subject'
-    }, ...datasets.map(_ref12 => {
+    }, ...datasets.map(_ref15 => {
       let {
         dataset,
         index
-      } = _ref12;
+      } = _ref15;
       const label = dataset.label || `SÉRIE ${index + 1}`,
         isPercent = label.includes('%');
       const unit = dataset.exportPercentUnit || percentUnit || (id === 'gContrato' ? 'fraction' : 'percent');
@@ -1365,8 +1742,8 @@ const ExportData = (() => {
     });
     return lines;
   };
-  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref13 => {
-    let [key, item] = _ref13;
+  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref16 => {
+    let [key, item] = _ref16;
     return [key, clone(item)];
   })) : value;
   const png = async (canvas, filename, title, chartConfig, visibleChart) => {
@@ -1381,7 +1758,7 @@ const ExportData = (() => {
       var _document$fonts;
       if ((_document$fonts = document.fonts) !== null && _document$fonts !== void 0 && _document$fonts.ready) await document.fonts.ready;
       if (chartConfig) {
-        var _chartConfig$options, _chartConfig$data$lab, _config$options, _config$options2, _config$options3;
+        var _chartConfig$options, _chartConfig$data$lab, _config$options2, _config$options3, _config$options4;
         holder = document.createElement('div');
         holder.style.cssText = 'position:fixed;left:-100000px;top:0;pointer-events:none;';
         image = document.createElement('canvas');
@@ -1390,7 +1767,7 @@ const ExportData = (() => {
         const horizontal = ((_chartConfig$options = chartConfig.options) === null || _chartConfig$options === void 0 ? void 0 : _chartConfig$options.indexAxis) === 'y';
         image.width = Math.max(1600, Math.min(2600, canvas.width));
         image.height = horizontal ? Math.min(16000, Math.max(900, (((_chartConfig$data$lab = chartConfig.data.labels) === null || _chartConfig$data$lab === void 0 ? void 0 : _chartConfig$data$lab.length) || 1) * 34 + 260)) : Math.max(1000, Math.min(1600, Math.round(image.width * canvas.height / Math.max(canvas.width, 1))));
-        const config = clone(chartConfig);
+        let config = clone(chartConfig);
         config.options = {
           ...config.options,
           responsive: false,
@@ -1406,11 +1783,11 @@ const ExportData = (() => {
             }
           },
           plugins: {
-            ...((_config$options = config.options) === null || _config$options === void 0 ? void 0 : _config$options.plugins),
+            ...((_config$options2 = config.options) === null || _config$options2 === void 0 ? void 0 : _config$options2.plugins),
             legend: {
-              ...((_config$options2 = config.options) === null || _config$options2 === void 0 || (_config$options2 = _config$options2.plugins) === null || _config$options2 === void 0 ? void 0 : _config$options2.legend),
+              ...((_config$options3 = config.options) === null || _config$options3 === void 0 || (_config$options3 = _config$options3.plugins) === null || _config$options3 === void 0 ? void 0 : _config$options3.legend),
               labels: {
-                ...((_config$options3 = config.options) === null || _config$options3 === void 0 || (_config$options3 = _config$options3.plugins) === null || _config$options3 === void 0 || (_config$options3 = _config$options3.legend) === null || _config$options3 === void 0 ? void 0 : _config$options3.labels),
+                ...((_config$options4 = config.options) === null || _config$options4 === void 0 || (_config$options4 = _config$options4.plugins) === null || _config$options4 === void 0 || (_config$options4 = _config$options4.legend) === null || _config$options4 === void 0 ? void 0 : _config$options4.labels),
                 font: {
                   size: 12
                 },
@@ -1419,6 +1796,11 @@ const ExportData = (() => {
             }
           }
         };
+        if (StatisticsPng.applies(chartConfig)) {
+          image.height = Math.max(image.height, StatisticsPng.minimumHeight(chartConfig, image.width));
+          config = StatisticsPng.configure(clone(chartConfig), image.width);
+        }
+        delete config.exportId;
         config.data.datasets = config.data.datasets.map((dataset, index) => ({
           ...dataset,
           hidden: visibleChart !== null && visibleChart !== void 0 && visibleChart.isDatasetVisible ? !visibleChart.isDatasetVisible(index) : dataset.hidden
@@ -1431,7 +1813,7 @@ const ExportData = (() => {
       }
       const output = document.createElement('canvas'),
         context = output.getContext('2d');
-      const scale = Math.max(1, image.width / 1100),
+      const scale = Math.max(1, image.width / (StatisticsPng.applies(chartConfig) ? 800 : 1100)),
         padding = Math.ceil(26 * scale),
         lineHeight = Math.ceil(20 * scale);
       output.width = image.width + padding * 2;
@@ -1795,11 +2177,11 @@ const startResize = e => {
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mouseup', onMouseUp);
 };
-function AutoFitText(_ref14) {
+function AutoFitText(_ref17) {
   let {
     text,
     className
-  } = _ref14;
+  } = _ref17;
   const containerRef = useRef(null);
   const textRef = useRef(null);
   useEffect(() => {
@@ -1827,7 +2209,7 @@ function AutoFitText(_ref14) {
     className: `${className} origin-left whitespace-nowrap inline-block`
   }, text));
 }
-const ChartComponent = _ref15 => {
+const ChartComponent = _ref18 => {
   let {
     type,
     data,
@@ -1838,7 +2220,7 @@ const ChartComponent = _ref15 => {
     exportColumns,
     exportPercentUnit,
     hideExportActions = false
-  } = _ref15;
+  } = _ref18;
   const coloredData = useMemo(() => MetricColors.chartData(data, type), [data, type]);
   const canvasRef = useRef(null),
     chartInstance = useRef(null);
@@ -1861,7 +2243,8 @@ const ChartComponent = _ref15 => {
   const handlePngExport = () => exportTable.toPNG(canvasRef.current, title(), title(), {
     type,
     data: coloredData,
-    options
+    options,
+    exportId: id
   }, chartInstance.current);
   const handleTableExport = format => {
     const result = exportRows && exportColumns ? {
@@ -1902,7 +2285,7 @@ const ChartComponent = _ref15 => {
 };
 
 // Componente: alterna entre Pizza, Barras e Tabela com seletor financeiro.
-function ToggleableChartCard(_ref16) {
+function ToggleableChartCard(_ref19) {
   var _title$match;
   let {
     title,
@@ -1911,7 +2294,7 @@ function ToggleableChartCard(_ref16) {
     id,
     isFornecedor,
     subjectLabel: subjectLabelProp
-  } = _ref16;
+  } = _ref19;
   const [viewMode, setViewMode] = useState('pie');
   const [finMetric, setFinMetric] = useState('total');
   const [tableSort, setTableSort] = useState({
@@ -2235,13 +2618,13 @@ function ToggleableChartCard(_ref16) {
   return /*#__PURE__*/React.createElement("div", {
     className: "bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex flex-col h-full hover:shadow-md transition"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "flex justify-between items-start mb-4 border-b border-slate-100 pb-3"
+    className: "flex flex-wrap justify-between items-start gap-2 mb-4 border-b border-slate-100 pb-3"
   }, /*#__PURE__*/React.createElement("h3", {
-    className: "text-[10px] font-black text-slate-800 uppercase tracking-tight flex-1 pr-2",
+    className: "text-[10px] font-black text-slate-800 uppercase tracking-tight min-w-0 flex-1 pr-2",
     "data-metric": isFinancial ? MetricColors.key(activeMetric) : undefined,
     style: isFinancial ? MetricColors.textStyle(activeMetric) : undefined
   }, displayTitle), /*#__PURE__*/React.createElement("div", {
-    className: "flex gap-2 items-center shrink-0"
+    className: "flex max-w-full flex-wrap gap-2 items-center"
   }, isFinancial && /*#__PURE__*/React.createElement("select", {
     value: finMetric,
     onChange: e => setFinMetric(e.target.value),
@@ -2367,18 +2750,18 @@ function ToggleableChartCard(_ref16) {
     exportTitle: displayTitle
   }))));
 }
-function ChartTableToggle(_ref17) {
+function ChartTableToggle(_ref20) {
   let {
     isTable,
     onToggle
-  } = _ref17;
+  } = _ref20;
   return /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: onToggle,
     className: "rounded border border-blue-200 bg-blue-50 px-3 py-1.5 text-[9px] font-black uppercase tracking-widest text-blue-600 shadow-sm transition hover:bg-blue-100"
   }, isTable ? '▥ GRÁFICO' : '▦ TABELA');
 }
-function SortableChartTable(_ref18) {
+function SortableChartTable(_ref21) {
   var _columns$;
   let {
     id,
@@ -2386,7 +2769,7 @@ function SortableChartTable(_ref18) {
     rows,
     columns,
     initialSortKey
-  } = _ref18;
+  } = _ref21;
   const [sort, setSort] = useState({
     key: initialSortKey || ((_columns$ = columns[0]) === null || _columns$ === void 0 ? void 0 : _columns$.key),
     direction: 'desc'
@@ -2415,12 +2798,12 @@ function SortableChartTable(_ref18) {
     if (typeof value === 'number') return value.toLocaleString('pt-BR');
     return value;
   };
-  const exportColumns = columns.map(_ref19 => {
+  const exportColumns = columns.map(_ref22 => {
     let {
       render,
       sortValue,
       ...column
-    } = _ref19;
+    } = _ref22;
     return column;
   });
   return /*#__PURE__*/React.createElement("div", {
@@ -2464,7 +2847,7 @@ function SortableChartTable(_ref18) {
     title: columnIndex === 0 ? row._tooltip || String(row[column.key] || '') : undefined
   }, displayValue(row, column)))))))));
 }
-function KPICard(_ref20) {
+function KPICard(_ref23) {
   let {
     title,
     value,
@@ -2475,7 +2858,7 @@ function KPICard(_ref20) {
     color,
     isCurrency,
     subLabel = "do Empenhado"
-  } = _ref20;
+  } = _ref23;
   const colors = {
     slate: "border-slate-800 text-slate-800",
     blue: "border-blue-500 text-blue-700",
@@ -2516,7 +2899,7 @@ function KPICard(_ref20) {
     className: "text-[10px] font-bold opacity-70 mt-1"
   }, formatPercentBR(subValue), " ", subLabel), renderExtraText()));
 }
-function TextHeader(_ref21) {
+function TextHeader(_ref24) {
   let {
     label,
     field,
@@ -2526,7 +2909,7 @@ function TextHeader(_ref21) {
     searchVal,
     onSearchChange,
     widthClass
-  } = _ref21;
+  } = _ref24;
   const isSorted = current.key === field;
   return /*#__PURE__*/React.createElement("th", {
     className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -2547,7 +2930,7 @@ function TextHeader(_ref21) {
     className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   }));
 }
-function NumericHeader(_ref22) {
+function NumericHeader(_ref25) {
   let {
     label,
     field,
@@ -2557,7 +2940,7 @@ function NumericHeader(_ref22) {
     setNumFilters,
     align = "left",
     widthClass
-  } = _ref22;
+  } = _ref25;
   const isSorted = current.key === field;
   const filterMin = numFilters[field] ? numFilters[field].min : '';
   const filterMax = numFilters[field] ? numFilters[field].max : '';
@@ -2616,7 +2999,7 @@ function NumericHeader(_ref22) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function DateFilterHeader(_ref23) {
+function DateFilterHeader(_ref26) {
   let {
     label,
     field,
@@ -2626,7 +3009,7 @@ function DateFilterHeader(_ref23) {
     setDateFilters,
     align = "left",
     widthClass
-  } = _ref23;
+  } = _ref26;
   const isSorted = current.key === field;
   const filterMin = dateFilters[field] ? dateFilters[field].min : '';
   const filterMax = dateFilters[field] ? dateFilters[field].max : '';
@@ -2677,13 +3060,13 @@ function DateFilterHeader(_ref23) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function MultiSelect(_ref24) {
+function MultiSelect(_ref27) {
   let {
     label,
     options,
     selected,
     onChange
-  } = _ref24;
+  } = _ref27;
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef();
@@ -2749,12 +3132,12 @@ function MultiSelect(_ref24) {
     title: o
   }, o))))));
 }
-function DateInput(_ref25) {
+function DateInput(_ref28) {
   let {
     label,
     value,
     onChange
-  } = _ref25;
+  } = _ref28;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
   }, label), /*#__PURE__*/React.createElement("input", {
@@ -2819,14 +3202,14 @@ function AccessMetadata() {
     className: "italic"
   }, "Produzido por Cel Brito"));
 }
-function CollapsibleSection(_ref26) {
+function CollapsibleSection(_ref29) {
   let {
     title,
     children,
     defaultOpen = false,
     globalTrigger,
     globalState
-  } = _ref26;
+  } = _ref29;
   const [isOpen, setIsOpen] = useState(defaultOpen);
   useEffect(() => {
     if (globalTrigger > 0) setIsOpen(globalState);
@@ -2957,20 +3340,20 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     document.addEventListener('mouseup', onMouseUp);
   };
   const exportTable = sharedExports;
-  const FormatNegativeValue = _ref27 => {
+  const FormatNegativeValue = _ref30 => {
     let {
       val
-    } = _ref27;
+    } = _ref30;
     if (val === null || val === undefined) return /*#__PURE__*/React.createElement("span", null, "-");
     const isNegative = val < -0.001;
     return /*#__PURE__*/React.createElement("span", {
       className: isNegative ? "underline decoration-red-500 decoration-[2px] underline-offset-2" : ""
     }, formatBRL(val));
   };
-  const ContratoCell = _ref28 => {
+  const ContratoCell = _ref31 => {
     let {
       row
-    } = _ref28;
+    } = _ref31;
     return /*#__PURE__*/React.createElement("div", {
       className: "flex flex-col"
     }, /*#__PURE__*/React.createElement("span", {
@@ -2981,14 +3364,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "text-[8px] text-slate-500 leading-tight whitespace-normal break-words"
     }, "Mod: ", row.modalidade));
   };
-  function CollapsibleSection(_ref29) {
+  function CollapsibleSection(_ref32) {
     let {
       title,
       children,
       defaultOpen = false,
       globalTrigger,
       globalState
-    } = _ref29;
+    } = _ref32;
     const [isOpen, setIsOpen] = useState(defaultOpen);
     useEffect(() => {
       if (globalTrigger > 0) setIsOpen(globalState);
@@ -3008,11 +3391,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-6"
     }, children));
   }
-  function AutoFitText(_ref30) {
+  function AutoFitText(_ref33) {
     let {
       text,
       className
-    } = _ref30;
+    } = _ref33;
     const containerRef = useRef(null);
     const textRef = useRef(null);
     useEffect(() => {
@@ -3040,12 +3423,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     }, text));
   }
   const ChartComponent = sharedChart;
-  function DocumentComposition(_ref31) {
+  function DocumentComposition(_ref34) {
     let {
       counts,
       amounts,
       uniqueDocs
-    } = _ref31;
+    } = _ref34;
     const canvasRef = useRef(null);
     const rows = useMemo(() => {
       const stages = [{
@@ -3242,7 +3625,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       role: "img"
     })));
   }
-  function LatestDocCard(_ref32) {
+  function LatestDocCard(_ref35) {
     var _MetricColors$get2;
     let {
       title,
@@ -3250,7 +3633,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       metricField,
       colorClass,
       showEmitente
-    } = _ref32;
+    } = _ref35;
     const first = docs === null || docs === void 0 ? void 0 : docs[0];
     const totalValue = useMemo(() => (docs || []).reduce((sum, doc) => sum + (doc[metricField] || 0), 0), [docs, metricField]);
     const daysText = useMemo(() => {
@@ -3305,7 +3688,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "break-words text-[9px] font-bold text-slate-500"
     }, doc.ug))))));
   }
-  function TextHeader(_ref33) {
+  function TextHeader(_ref36) {
     let {
       label,
       field,
@@ -3315,7 +3698,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       searchVal,
       onSearchChange,
       widthClass
-    } = _ref33;
+    } = _ref36;
     const isSorted = current.key === field;
     return /*#__PURE__*/React.createElement("th", {
       className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -3336,7 +3719,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     }));
   }
-  function NumericHeader(_ref34) {
+  function NumericHeader(_ref37) {
     let {
       label,
       field,
@@ -3346,7 +3729,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setNumFilters,
       align = "left",
       widthClass
-    } = _ref34;
+    } = _ref37;
     const isSorted = current.key === field;
     const handleMin = e => setNumFilters(p => ({
       ...p,
@@ -3391,7 +3774,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function DateFilterHeader(_ref35) {
+  function DateFilterHeader(_ref38) {
     let {
       label,
       field,
@@ -3401,7 +3784,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setDateFilters,
       align = "left",
       widthClass
-    } = _ref35;
+    } = _ref38;
     const isSorted = current.key === field;
     const handleMin = e => setDateFilters(p => ({
       ...p,
@@ -3444,13 +3827,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function MultiSelect(_ref36) {
+  function MultiSelect(_ref39) {
     let {
       label,
       options,
       selected,
       onChange
-    } = _ref36;
+    } = _ref39;
     const [isOpen, setIsOpen] = useState(false);
     const [search, setSearch] = useState("");
     const ref = useRef();
@@ -3514,12 +3897,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "truncate leading-tight"
     }, o))))));
   }
-  function DateInput(_ref37) {
+  function DateInput(_ref40) {
     let {
       label,
       value,
       onChange
-    } = _ref37;
+    } = _ref40;
     return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
       className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
     }, label), /*#__PURE__*/React.createElement("input", {
@@ -3529,7 +3912,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-sm cursor-pointer"
     }));
   }
-  function KPICard(_ref38) {
+  function KPICard(_ref41) {
     let {
       title,
       value,
@@ -3539,7 +3922,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       color,
       isCurrency,
       extraText
-    } = _ref38;
+    } = _ref41;
     const colors = {
       slate: "border-slate-800 text-slate-800",
       blue: "border-blue-500 text-blue-700",
@@ -3573,13 +3956,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       key: idx
     }, line)))));
   }
-  function DocStatCard(_ref39) {
+  function DocStatCard(_ref42) {
     let {
       title,
       count,
       date,
       timestamp
-    } = _ref39;
+    } = _ref42;
     const daysText = useMemo(() => {
       if (!timestamp) return '';
       const today = new Date();
@@ -3604,7 +3987,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // COMPONENTE: SUBTABELA DETALHADA
   // =========================================================
-  function SubTable(_ref40) {
+  function SubTable(_ref43) {
     let {
       title,
       data,
@@ -3614,7 +3997,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       rowBgColor,
       textColor,
       showDiasAss = false
-    } = _ref40;
+    } = _ref43;
     const [limit, setLimit] = useState(100);
     const [sortConfig, setSortConfig] = useState({
       key: 'diaVal',
@@ -4097,7 +4480,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "p-2 font-bold text-slate-700 whitespace-normal break-words"
     }, row.ug), visibleCols.favorecido && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-600 font-bold whitespace-normal break-words leading-tight"
-    }, row.favorecido), visibleCols.objeto && /*#__PURE__*/React.createElement("td", {
+    }, /*#__PURE__*/React.createElement(CounterpartyLink, {
+      name: row.favorecido,
+      identifier: row.favorecido_cnpj,
+      title: "Abrir favorecido no Portal da Transpar\xEAncia"
+    })), visibleCols.objeto && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-500 whitespace-normal break-words leading-tight"
     }, row.objeto), visibleCols.gestor && /*#__PURE__*/React.createElement("td", {
       className: "p-2 whitespace-normal break-words"
@@ -4147,7 +4534,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // DASHBOARD MASTER CONTÁBIL
   // =========================================================
-  function useDashboard(_ref41) {
+  function useDashboard(_ref44) {
     let {
       payload,
       shared,
@@ -4156,7 +4543,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       globalExpandState,
       expandTrigger,
       resetRevision
-    } = _ref41;
+    } = _ref44;
     const [rawData, setRawData] = useState([]);
     const [processedPayload, setProcessedPayload] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -4669,6 +5056,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         const dia = getVC(["Emissão - Dia Data Completa", "Emissao"], ["emissao", "dia", "data"], row);
         const ug = getVC(["Emitente - UG Código", "UG Codigo"], ["ug codigo", "emitente"], row).toUpperCase();
         const fav = getVC(["Favorecido Doc. Nome", "Favorecido"], ["favorecido", "doc. nome"], row).toUpperCase();
+        const favCnpj = getFornecedorCnpj(fav) || ["Favorecido Doc. Código", "Favorecido Doc. Codigo", "Favorecido Doc. CNPJ", "Favorecido CNPJ", "CNPJ Favorecido"].map(name => getFornecedorCnpj(getVC([name], [], row))).find(Boolean) || "";
         const empenho = getVC(["Documento CCor Número"], ["ccor", "empenho"], row).toUpperCase();
         const doc = getVC(["Documento Número"], ["documento numero", "doc numero"], row).toUpperCase();
         const obs = getVC(["Doc - Observação Texto", "Observação"], ["observacao", "obs"], row).toUpperCase();
@@ -4691,7 +5079,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         const valor = parseValue(valStr);
         const diaVal = parseDateBR(dia) ? parseDateBR(dia).getTime() : 0;
-        const key = `${dia}|${ug}|${fav}|${empenho}|${doc}|${contrato}`;
+        const key = `${dia}|${ug}|${fav}|${favCnpj}|${empenho}|${doc}|${contrato}`;
         if (doc.includes("RO") && diaVal > 0 && contrato !== "-") {
           const keyRE = `${UnifiedData.key(contrato)}|${UnifiedData.key(empenho)}`;
           if (!minRoDict[keyRE] || diaVal < minRoDict[keyRE]) minRoDict[keyRE] = diaVal;
@@ -4704,6 +5092,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             diaVal,
             ug,
             favorecido: fav,
+            favorecido_cnpj: favCnpj,
             empenho,
             documento: doc,
             obs,
@@ -6899,7 +7288,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         className: "p-2 font-bold text-slate-700 whitespace-normal break-words"
       }, row.ug), masterCols.favorecido && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-600 font-bold whitespace-normal break-words leading-tight"
-      }, row.favorecido), masterCols.objeto && /*#__PURE__*/React.createElement("td", {
+      }, /*#__PURE__*/React.createElement(CounterpartyLink, {
+        name: row.favorecido,
+        identifier: row.favorecido_cnpj,
+        title: "Abrir favorecido no Portal da Transpar\xEAncia"
+      })), masterCols.objeto && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-500 whitespace-normal break-words leading-tight"
       }, row.objeto), masterCols.gestor && /*#__PURE__*/React.createElement("td", {
         className: "p-2 whitespace-normal break-words"
@@ -7393,16 +7786,16 @@ function Dashboard() {
   const [linkDiagnostics, setLinkDiagnostics] = useState(null);
   const [resetRevision, setResetRevision] = useState(0);
   const loadingRef = useRef(false);
-  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV3') === '1');
+  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV4') === '1');
   const closeSummary = React.useCallback(() => {
-    sessionStorage.removeItem('summary_pending_TotalV3');
+    sessionStorage.removeItem('summary_pending_TotalV4');
     setSummaryRequested(false);
   }, []);
   const [activePage, setActivePage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("A verificar sessão local...");
-  const currentUser = sessionStorage.getItem('user_TotalV3') || 'Usuário';
-  const currentPerfil = sessionStorage.getItem('perfil_TotalV3') || '';
+  const currentUser = sessionStorage.getItem('user_TotalV4') || 'Usuário';
+  const currentPerfil = sessionStorage.getItem('perfil_TotalV4') || '';
 
   // Estado de Expansão Global das seções
   const [globalExpandState, setGlobalExpandState] = useState(false);
@@ -7825,7 +8218,7 @@ function Dashboard() {
     clearAuthStorage();
     try {
       localStorage.removeItem(DASH_CACHE_KEY);
-      localStorage.removeItem('dashData_TotalV3');
+      localStorage.removeItem('dashData_TotalV4');
     } catch (e) {}
     window.location.reload();
   };
@@ -8093,8 +8486,8 @@ function Dashboard() {
     const headers = rowsArray[0];
     const normalizedHeaders = headers.map(normalizeStr);
     const headerIndices = new Map(normalizedHeaders.map((value, index) => [value, index]));
-    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref42 => {
-      let [contract, totals] = _ref42;
+    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref45 => {
+      let [contract, totals] = _ref45;
       return [contract, totals.v_recebido];
     }));
     const receivedAssigned = new Set();
@@ -8141,8 +8534,8 @@ function Dashboard() {
       const receivedKey = normalizeContractKey(contrato);
       const v_recebido = receivedAssigned.has(receivedKey) ? 0 : recebidoByContrato[receivedKey] || 0;
       receivedAssigned.add(receivedKey);
-      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref43 => {
-        let [key] = _ref43;
+      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref46 => {
+        let [key] = _ref46;
         return normalizeContractKey(key) === normalizeContractKey(contrato);
       })) === null || _Object$entries$find === void 0 ? void 0 : _Object$entries$find[1]) || emptyOrcamentario();
       const v_a_liquidar = v_empenhado - v_liquidado - v_cancelado - v_bloqueado;
@@ -8195,9 +8588,9 @@ function Dashboard() {
       };
     }).filter(r => r.contrato !== "-");
     const canonicalIndex = ContractRules.contractIndex(mappedRaw);
-    const canonicalClassifications = new Map([...canonicalIndex].map(_ref44 => {
+    const canonicalClassifications = new Map([...canonicalIndex].map(_ref47 => {
       var _ledgerIndex$get;
-      let [id, entry] = _ref44;
+      let [id, entry] = _ref47;
       return [id, ContractRules.classify(entry.totals, entry.metadata, (_ledgerIndex$get = ledgerIndex.get(id)) === null || _ledgerIndex$get === void 0 ? void 0 : _ledgerIndex$get.hasMovement, hoje)];
     }));
 
@@ -8244,7 +8637,7 @@ function Dashboard() {
     }
     try {
       setStatus("A transferir dados via Api...");
-      const token = sessionStorage.getItem('token_TotalV3');
+      const token = sessionStorage.getItem('token_TotalV4');
       if (!token) throw new Error("Token de acesso não encontrado. Faça login novamente.");
       const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}`);
       const json = await readAppsScriptJson(response, 'a sincronização dos dados');
@@ -8320,8 +8713,8 @@ function Dashboard() {
       nd_subelemento_filter_values: 'nd_subelemento_filter_values'
     };
     documentDashboard.budgetIndex.byContract.forEach(details => details.forEach(detail => {
-      Object.entries(budgetOptionsMap).forEach(_ref45 => {
-        let [field, property] = _ref45;
+      Object.entries(budgetOptionsMap).forEach(_ref48 => {
+        let [field, property] = _ref48;
         const values = Array.isArray(detail[property]) ? detail[property] : splitBudgetDimensionValue(detail[property]);
         values.forEach(value => {
           if (value && value !== '-' && value !== 'N/I') accumulators[field].add(value);
@@ -9886,8 +10279,8 @@ function Dashboard() {
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVencidos30Active ? 'bg-red-700 text-white border-red-700 ring-2 ring-red-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VENCIDOS H\xC1 30 DIAS")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
-  }, Object.entries(tagColorsMap).map(_ref46 => {
-    let [label, config] = _ref46;
+  }, Object.entries(tagColorsMap).map(_ref49 => {
+    let [label, config] = _ref49;
     const isActive = fSituacaoTags.includes(label);
     return /*#__PURE__*/React.createElement("button", {
       key: label,
@@ -12183,13 +12576,10 @@ Substituto: ${kpis.qtdFiscaisSub}`,
       className: "master-text-col p-3 text-slate-600 font-black break-words"
     }, row.sec_log), masterVisibleCols.fornecedor && /*#__PURE__*/React.createElement("td", {
       className: "master-text-col p-3 text-slate-600 font-bold break-words"
-    }, getFornecedorCnpj(row.fornecedor) ? /*#__PURE__*/React.createElement("a", {
-      href: `https://portaldatransparencia.gov.br/pessoa-juridica/${getFornecedorCnpj(row.fornecedor)}`,
-      target: "_blank",
-      rel: "noopener noreferrer",
-      className: "text-blue-700 hover:text-blue-900 hover:underline",
+    }, /*#__PURE__*/React.createElement(CounterpartyLink, {
+      name: row.fornecedor,
       title: "Abrir fornecedor no Portal da Transpar\xEAncia"
-    }, row.fornecedor) : row.fornecedor), masterVisibleCols.objeto && /*#__PURE__*/React.createElement("td", {
+    })), masterVisibleCols.objeto && /*#__PURE__*/React.createElement("td", {
       className: "master-text-col p-3 text-slate-500 break-words"
     }, row.objeto), masterVisibleCols.gestorFiscal && /*#__PURE__*/React.createElement("td", {
       className: "master-text-col p-3 break-words"
@@ -12408,7 +12798,7 @@ class ErrorBoundary extends React.Component {
       onClick: () => {
         clearAuthStorage();
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV3');
+        localStorage.removeItem('dashData_TotalV4');
         window.location.reload();
       },
       className: "bg-red-600 text-white px-6 py-3 rounded shadow font-bold hover:bg-red-700"
@@ -12442,17 +12832,17 @@ function App() {
         setIsLogging(false);
         return;
       }
-      sessionStorage.setItem('token_TotalV3', json.token);
-      sessionStorage.setItem('summary_pending_TotalV3', '1');
-      sessionStorage.setItem('user_TotalV3', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
-      sessionStorage.setItem('perfil_TotalV3', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
-      sessionStorage.setItem('ativo_TotalV3', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
-      sessionStorage.setItem('validade_TotalV3', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
-      sessionStorage.setItem('duracao_diaria_horas_TotalV3', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
-      sessionStorage.setItem('expira_TotalV3', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
+      sessionStorage.setItem('token_TotalV4', json.token);
+      sessionStorage.setItem('summary_pending_TotalV4', '1');
+      sessionStorage.setItem('user_TotalV4', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
+      sessionStorage.setItem('perfil_TotalV4', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
+      sessionStorage.setItem('ativo_TotalV4', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
+      sessionStorage.setItem('validade_TotalV4', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
+      sessionStorage.setItem('duracao_diaria_horas_TotalV4', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
+      sessionStorage.setItem('expira_TotalV4', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
       try {
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV3');
+        localStorage.removeItem('dashData_TotalV4');
       } catch (e) {}
       setIsAuthenticated(true);
       setIsLogging(false);
