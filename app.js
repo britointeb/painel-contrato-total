@@ -110,6 +110,7 @@ const UnifiedData = (() => {
         empenho: row.empenho,
         ug: row.ug || '-',
         fornecedor: row.favorecido || '-',
+        portal_contexts: [],
         contracts: new Set(),
         descriptions: new Set(),
         global: 0,
@@ -122,6 +123,15 @@ const UnifiedData = (() => {
       });
       const group = groups.get(identity);
       if (row.contrato && row.contrato !== '-') group.contracts.add(key(row.contrato));
+      const commitmentContexts = Object.prototype.hasOwnProperty.call(row, "portal_contexts") ? Array.isArray(row.portal_contexts) && row.portal_contexts.length ? row.portal_contexts : [{}] : [{
+        ug: row.portal_ug ?? row.ug,
+        gestao: row.gestao
+      }];
+      commitmentContexts.forEach(context => {
+        if (!group.portal_contexts.some(item => item.ug === context.ug && item.gestao === context.gestao)) group.portal_contexts.push({
+          ...context
+        });
+      });
       group.descriptions.add(`Empenho: ${row.empenho} | Contrato: ${row.contrato || '-'} | Emitente: ${row.ug || '-'} | Favorecido: ${row.favorecido || '-'}`);
       group.total += number(row.v_empenhado);
       group.recebido += number(row.v_recebido);
@@ -507,7 +517,8 @@ const ContractRules = (() => {
           valueCents: 0,
           dateValues: new Set(),
           contractSuppliers: new Map(),
-          contractBeneficiaries: new Map()
+          contractBeneficiaries: new Map(),
+          portalContexts: new Map()
         });
         const detail = target.documents.get(id),
           value = cents(row[target.field]);
@@ -526,6 +537,18 @@ const ContractRules = (() => {
             beneficiary
           });
         }
+        const portalContexts = Object.prototype.hasOwnProperty.call(row, 'portal_contexts') ? Array.isArray(row.portal_contexts) ? row.portal_contexts : [] : [{
+          ug: row.portal_ug ?? row.ug ?? '',
+          gestao: row.gestao || ''
+        }];
+        portalContexts.forEach(context => {
+          if (!context || typeof context !== 'object') return;
+          const portalKey = [UnifiedData.key(context.ug), UnifiedData.key(context.gestao)].join('|');
+          if (!detail.portalContexts.has(portalKey)) detail.portalContexts.set(portalKey, {
+            ug: context.ug || '',
+            gestao: context.gestao || ''
+          });
+        });
         detail.valueCents += value;
         detail.dateValues.add(day);
         target.valueCents += value;
@@ -546,30 +569,63 @@ const ContractRules = (() => {
       })),
       movements: Object.fromEntries(Object.entries(movements).map(_ref4 => {
         let [name, row] = _ref4;
+        const documents = [...row.documents.values()].map(detail => {
+          const dateValues = [...detail.dateValues].sort((a, b) => a - b),
+            dates = dateValues.map(formatDate);
+          const contractSuppliers = [...detail.contractSuppliers.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
+            numeric: true
+          }));
+          const contractBeneficiaries = [...detail.contractBeneficiaries.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
+            numeric: true
+          }) || a.beneficiary.localeCompare(b.beneficiary, 'pt-BR'));
+          const suppliers = new Map(contractSuppliers.map(pair => [UnifiedData.key(pair.contract), pair.supplier]));
+          const contractParties = contractBeneficiaries.map(pair => ({
+            contract: pair.contract,
+            supplier: suppliers.get(UnifiedData.key(pair.contract)) || 'N/I',
+            beneficiary: pair.beneficiary
+          }));
+          return {
+            id: detail.id,
+            document: detail.document,
+            ug: detail.ug,
+            value: detail.valueCents / 100,
+            date: dates.join('; '),
+            dates,
+            dateValue: dateValues[dateValues.length - 1],
+            contractSuppliers,
+            contractBeneficiaries,
+            contractParties,
+            portal_contexts: [...detail.portalContexts.values()]
+          };
+        }).sort((a, b) => b.dateValue - a.dateValue || String(a.document).localeCompare(String(b.document), 'pt-BR', {
+          numeric: true
+        }) || String(a.ug).localeCompare(String(b.ug), 'pt-BR'));
+        const groups = new Map();
+        documents.forEach(document => {
+          // Each UG/document occurs once, under its latest date in the
+          // period; its line retains every date contributing to its total.
+          if (!groups.has(document.dateValue)) {
+            const local = new Date(document.dateValue);
+            const dateTime = `${local.getFullYear()}-${String(local.getMonth() + 1).padStart(2, '0')}-${String(local.getDate()).padStart(2, '0')}`;
+            groups.set(document.dateValue, {
+              dateValue: document.dateValue,
+              date: formatDate(document.dateValue),
+              dateTime,
+              documents: [],
+              portal_contexts: []
+            });
+          }
+          const group = groups.get(document.dateValue);
+          group.documents.push(document);
+          document.portal_contexts.forEach(context => {
+            if (!group.portal_contexts.some(existing => UnifiedData.key(existing.ug) === UnifiedData.key(context.ug) && UnifiedData.key(existing.gestao) === UnifiedData.key(context.gestao))) group.portal_contexts.push(context);
+          });
+        });
         return [name, {
           count: row.documents.size,
           value: row.valueCents / 100,
-          documents: [...row.documents.values()].map(detail => {
-            const dateValues = [...detail.dateValues].sort((a, b) => a - b),
-              dates = dateValues.map(formatDate);
-            return {
-              id: detail.id,
-              document: detail.document,
-              ug: detail.ug,
-              value: detail.valueCents / 100,
-              date: dates.join('; '),
-              dates,
-              dateValue: dateValues[dateValues.length - 1],
-              contractSuppliers: [...detail.contractSuppliers.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
-                numeric: true
-              })),
-              contractBeneficiaries: [...detail.contractBeneficiaries.values()].sort((a, b) => String(a.contract).localeCompare(String(b.contract), 'pt-BR', {
-                numeric: true
-              }) || a.beneficiary.localeCompare(b.beneficiary, 'pt-BR'))
-            };
-          }).sort((a, b) => b.dateValue - a.dateValue || String(a.document).localeCompare(String(b.document), 'pt-BR', {
-            numeric: true
-          }) || String(a.ug).localeCompare(String(b.ug), 'pt-BR'))
+          documents,
+          dayGroups: [...groups.values()]
         }];
       }))
     };
@@ -667,24 +723,40 @@ function LoginSummaryModal(_ref5) {
       className: "ml-1 text-xs text-slate-500"
     }, "(", row.decorations.join(' · '), ")"));
   })));
-  const documentList = (items, label, metric) => !(items !== null && items !== void 0 && items.length) ? /*#__PURE__*/React.createElement("p", {
-    className: "mt-3 text-sm text-slate-500"
-  }, "Nenhum documento neste per\xEDodo.") : /*#__PURE__*/React.createElement("div", {
-    role: "region",
-    "aria-label": `Documentos ${label.toLowerCase()}`,
-    tabIndex: 0,
-    className: "mt-3 max-h-60 overflow-y-auto rounded-lg border border-slate-100 p-2 outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-  }, /*#__PURE__*/React.createElement("ul", {
-    className: "space-y-2 text-[11px] leading-relaxed text-slate-700"
-  }, items.map(row => /*#__PURE__*/React.createElement("li", {
-    key: row.id,
-    title: `UG ${row.ug} · Datas: ${row.date}`,
-    className: "break-words border-b border-slate-100 pb-2 last:border-0 last:pb-0"
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "font-bold"
-  }, row.document), ' – ', /*#__PURE__*/React.createElement("span", {
-    className: "tabular-nums"
-  }, formatBRL(row.value)), ' – ', metric === 'recebido' ? row.contractBeneficiaries.map(pair => `${pair.contract} – ${pair.beneficiary}`).join('; ') : row.contractSuppliers.map(pair => `${pair.contract} – ${pair.supplier}`).join('; '), ' – ', row.date))));
+  const documentList = (movement, label, metric) => {
+    var _movement$documents;
+    return !((_movement$documents = movement.documents) !== null && _movement$documents !== void 0 && _movement$documents.length) ? /*#__PURE__*/React.createElement("p", {
+      className: "mt-3 text-sm text-slate-500"
+    }, "Nenhum documento neste per\xEDodo.") : /*#__PURE__*/React.createElement("div", {
+      role: "region",
+      "aria-label": `Documentos ${label.toLowerCase()}`,
+      tabIndex: 0,
+      className: "mt-3 max-h-60 overflow-y-auto rounded-lg border border-slate-100 p-2 outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "space-y-3 text-[11px] leading-relaxed text-slate-700"
+    }, movement.dayGroups.map(group => /*#__PURE__*/React.createElement("section", {
+      key: group.dateTime,
+      "aria-labelledby": `summary-${metric}-${group.dateTime}`
+    }, /*#__PURE__*/React.createElement("h5", {
+      id: `summary-${metric}-${group.dateTime}`,
+      className: "mb-2 border-b border-slate-200 pb-1 text-[11px] font-bold text-slate-600"
+    }, /*#__PURE__*/React.createElement("time", {
+      dateTime: group.dateTime
+    }, group.date)), /*#__PURE__*/React.createElement("ul", {
+      className: "space-y-2 text-[11px] leading-relaxed text-slate-700"
+    }, group.documents.map(row => /*#__PURE__*/React.createElement("li", {
+      key: row.id,
+      title: `UG ${row.ug} · Datas: ${row.date}`,
+      className: "break-words border-b border-slate-100 pb-2 last:border-0 last:pb-0"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "font-bold"
+    }, /*#__PURE__*/React.createElement(PortalDocumentLink, {
+      value: row.document,
+      context: row
+    })), ' – ', /*#__PURE__*/React.createElement("span", {
+      className: "tabular-nums"
+    }, formatBRL(row.value)), ' – ', metric === 'recebido' ? row.contractParties.map(pair => `${pair.contract} – ${pair.supplier} – ${pair.beneficiary}`).join('; ') : row.contractSuppliers.map(pair => `${pair.contract} – ${pair.supplier}`).join('; '), ' – ', row.date)))))));
+  };
   return /*#__PURE__*/React.createElement("div", {
     className: "fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 p-3 md:p-6"
   }, /*#__PURE__*/React.createElement("section", {
@@ -779,7 +851,7 @@ function LoginSummaryModal(_ref5) {
       className: "mt-2 break-words text-lg font-black"
     }, formatBRL(summary.movements[metric].value)), /*#__PURE__*/React.createElement("p", {
       className: "mt-1 text-xs text-slate-500"
-    }, summary.movements[metric].count.toLocaleString('pt-BR'), " documentos"), documentList(summary.movements[metric].documents, label, metric));
+    }, summary.movements[metric].count.toLocaleString('pt-BR'), " documentos"), documentList(summary.movements[metric], label, metric));
   }))));
 }
 
@@ -1237,9 +1309,9 @@ const normalizeStr = str => {
 
 // Implantação V1_GPT, compatível com o Code.gs orçamentário por documento CCor.
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwDf4gT-FPusNrbuXS0t-dE-LCLmqXmMVG7QX34GuQUHWc3EwjEargr1Mdi4DeXwpxf/exec";
-const DASH_CACHE_KEY = 'dashData_TotalV4_total_v4';
-const DASH_VERSION = 'V4';
-const AUTH_STORAGE_KEYS = ['summary_pending_TotalV4', 'token_TotalV4', 'user_TotalV4', 'perfil_TotalV4', 'ativo_TotalV4', 'validade_TotalV4', 'duracao_diaria_horas_TotalV4', 'expira_TotalV4'];
+const DASH_CACHE_KEY = 'dashData_TotalV5_total_v5';
+const DASH_VERSION = 'V5';
+const AUTH_STORAGE_KEYS = ['summary_pending_TotalV5', 'token_TotalV5', 'user_TotalV5', 'perfil_TotalV5', 'ativo_TotalV5', 'validade_TotalV5', 'duracao_diaria_horas_TotalV5', 'expira_TotalV5'];
 const clearAuthStorage = () => {
   try {
     AUTH_STORAGE_KEYS.forEach(key => sessionStorage.removeItem(key));
@@ -1247,9 +1319,9 @@ const clearAuthStorage = () => {
 };
 const isAuthSessionValid = () => {
   try {
-    const token = sessionStorage.getItem('token_TotalV4');
+    const token = sessionStorage.getItem('token_TotalV5');
     if (!token) return false;
-    const expiraEm = Number(sessionStorage.getItem('expira_TotalV4') || 0);
+    const expiraEm = Number(sessionStorage.getItem('expira_TotalV5') || 0);
     if (expiraEm && Date.now() > expiraEm) {
       clearAuthStorage();
       return false;
@@ -1323,6 +1395,83 @@ function CounterpartyLink(_ref7) {
     className: "text-blue-700 hover:text-blue-900 hover:underline",
     title: title
   }, name) : /*#__PURE__*/React.createElement("span", null, name);
+}
+
+// Document identifiers use the exact Portal da Transparencia paths supplied
+// by the user. Short identifiers need actual issuer UG and management codes.
+const PortalDocuments = (() => {
+  const routes = Object.freeze({
+    NE: 'empenho',
+    NS: 'liquidacao',
+    OB: 'pagamento',
+    DF: 'pagamento'
+  });
+  const clean = value => String(value ?? '').trim().toUpperCase();
+  const code = (value, width) => {
+    const text = clean(value);
+    return new RegExp('^\\d{1,' + width + '}$').test(text) ? text.padStart(width, '0') : '';
+  };
+  const full = value => clean(value).match(/^(\d{6})(\d{5})(\d{4})(NE|NS|OB|DF)(\d{6})$/);
+  const short = value => clean(value).match(/^(\d{4})(NE|NS|OB|DF)(\d{6})$/);
+  const url = function (value) {
+    let context = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    const complete = full(value);
+    if (complete) return 'https://portaldatransparencia.gov.br/despesas/' + routes[complete[4]] + '/' + complete[0];
+    const partial = short(value);
+    if (!partial) return '';
+    const hasContexts = Object.prototype.hasOwnProperty.call(context || {}, 'portal_contexts');
+    const contexts = hasContexts ? context.portal_contexts : [context];
+    if (!Array.isArray(contexts) || !contexts.length) return '';
+    const candidates = new Set();
+    for (const item of contexts) {
+      const ug = code((item === null || item === void 0 ? void 0 : item.portal_ug) ?? (item === null || item === void 0 ? void 0 : item.ug), 6),
+        management = code(item === null || item === void 0 ? void 0 : item.gestao, 5);
+      if (!ug || !management) return '';
+      candidates.add(ug + management + partial[0]);
+    }
+    return candidates.size === 1 ? 'https://portaldatransparencia.gov.br/despesas/' + routes[partial[2]] + '/' + [...candidates][0] : '';
+  };
+  return Object.freeze({
+    url,
+    full,
+    short
+  });
+})();
+function PortalDocumentLink(_ref8) {
+  let {
+    value,
+    context,
+    children
+  } = _ref8;
+  const href = PortalDocuments.url(value, context),
+    label = children ?? value;
+  return href ? /*#__PURE__*/React.createElement("a", {
+    href: href,
+    target: "_blank",
+    rel: "noopener noreferrer",
+    className: "text-blue-700 hover:text-blue-900 hover:underline",
+    title: "Abrir documento no Portal da Transpar\xEAncia"
+  }, label) : /*#__PURE__*/React.createElement("span", null, label);
+}
+function PortalDocumentTableValue(_ref9) {
+  let {
+    value,
+    row,
+    field
+  } = _ref9;
+  if (['documento', 'document', 'empenho'].includes(field)) return /*#__PURE__*/React.createElement(PortalDocumentLink, {
+    value: value,
+    context: row
+  });
+  // Top20 commitment subjects also display the contract and issuer. Only the
+  // actual commitment number is clickable; contract text remains unchanged.
+  if (['subject', 'label'].includes(field) && row.empenho && typeof value === 'string' && value.startsWith(row.empenho) && (PortalDocuments.full(row.empenho) || PortalDocuments.short(row.empenho))) {
+    return /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement(PortalDocumentLink, {
+      value: row.empenho,
+      context: row
+    }), value.slice(row.empenho.length));
+  }
+  return value;
 }
 const shortenNumber = num => {
   if (!num) return "0";
@@ -1463,9 +1612,9 @@ const StatisticsPng = (() => {
             pieLinePlugin: false
           } : {})
         },
-        scales: original.scales ? Object.fromEntries(Object.entries(original.scales).map(_ref8 => {
+        scales: original.scales ? Object.fromEntries(Object.entries(original.scales).map(_ref10 => {
           var _scale$ticks, _scale$title;
-          let [key, scale] = _ref8;
+          let [key, scale] = _ref10;
           return [key, {
             ...scale,
             ticks: {
@@ -1545,8 +1694,8 @@ const StatisticsPng = (() => {
         ctx.fillStyle = datalabels.color || '#334155';
         ctx.strokeStyle = '#94a3b8';
         ctx.lineWidth = 1.5 * unit;
-        Object.entries(sides).forEach(_ref9 => {
-          let [side, items] = _ref9;
+        Object.entries(sides).forEach(_ref11 => {
+          let [side, items] = _ref11;
           return distribute(items, top, bottom, Math.min(gap, items.length > 1 ? (bottom - top) / (items.length - 1) : gap)).forEach(item => {
             const sign = side === 'left' ? -1 : 1;
             ctx.beginPath();
@@ -1599,28 +1748,28 @@ const ExportData = (() => {
     const datasets = ((data === null || data === void 0 ? void 0 : data.datasets) || []).map((dataset, index) => ({
       dataset,
       index
-    })).filter(_ref10 => {
+    })).filter(_ref12 => {
       let {
         dataset,
         index
-      } = _ref10;
+      } = _ref12;
       return dataset.hidden !== true && (!(chart !== null && chart !== void 0 && chart.isDatasetVisible) || chart.isDatasetVisible(index));
     });
     const visiblePoint = index => !(type === 'pie' || type === 'doughnut') || !(chart !== null && chart !== void 0 && chart.getDataVisibility) || chart.getDataVisibility(index);
-    const objectData = datasets.some(_ref11 => {
+    const objectData = datasets.some(_ref13 => {
       let {
         dataset
-      } = _ref11;
+      } = _ref13;
       return (dataset.data || []).some(point => point && typeof point === 'object' && !Array.isArray(point));
     });
     if (objectData) {
       const rows = [],
         keys = new Set();
-      datasets.forEach(_ref12 => {
+      datasets.forEach(_ref14 => {
         let {
           dataset,
           index
-        } = _ref12;
+        } = _ref14;
         return (dataset.data || []).forEach((point, pointIndex) => {
           if (!visiblePoint(pointIndex) || !point || typeof point !== 'object') return;
           const contractPoint = Object.prototype.hasOwnProperty.call(point, 'contrato') || Object.prototype.hasOwnProperty.call(point, 'v_empenhado');
@@ -1641,10 +1790,10 @@ const ExportData = (() => {
           rows.push(row);
         });
       });
-      const monetaryY = datasets.every(_ref13 => {
+      const monetaryY = datasets.every(_ref15 => {
         let {
           dataset
-        } = _ref13;
+        } = _ref15;
         return moneySeries(dataset.label || '');
       });
       return {
@@ -1665,12 +1814,12 @@ const ExportData = (() => {
       const row = {
         subject: joinedLabel(label)
       };
-      datasets.forEach(_ref14 => {
+      datasets.forEach(_ref16 => {
         var _dataset$data;
         let {
           dataset,
           index: datasetIndex
-        } = _ref14;
+        } = _ref16;
         row[`dataset_${datasetIndex}`] = ((_dataset$data = dataset.data) === null || _dataset$data === void 0 ? void 0 : _dataset$data[index]) ?? null;
       });
       return [row];
@@ -1678,11 +1827,11 @@ const ExportData = (() => {
     const columns = [{
       header: 'ASSUNTO',
       key: 'subject'
-    }, ...datasets.map(_ref15 => {
+    }, ...datasets.map(_ref17 => {
       let {
         dataset,
         index
-      } = _ref15;
+      } = _ref17;
       const label = dataset.label || `SÉRIE ${index + 1}`,
         isPercent = label.includes('%');
       const unit = dataset.exportPercentUnit || percentUnit || (id === 'gContrato' ? 'fraction' : 'percent');
@@ -1742,8 +1891,8 @@ const ExportData = (() => {
     });
     return lines;
   };
-  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref16 => {
-    let [key, item] = _ref16;
+  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref18 => {
+    let [key, item] = _ref18;
     return [key, clone(item)];
   })) : value;
   const png = async (canvas, filename, title, chartConfig, visibleChart) => {
@@ -2177,11 +2326,11 @@ const startResize = e => {
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mouseup', onMouseUp);
 };
-function AutoFitText(_ref17) {
+function AutoFitText(_ref19) {
   let {
     text,
     className
-  } = _ref17;
+  } = _ref19;
   const containerRef = useRef(null);
   const textRef = useRef(null);
   useEffect(() => {
@@ -2209,7 +2358,7 @@ function AutoFitText(_ref17) {
     className: `${className} origin-left whitespace-nowrap inline-block`
   }, text));
 }
-const ChartComponent = _ref18 => {
+const ChartComponent = _ref20 => {
   let {
     type,
     data,
@@ -2220,7 +2369,7 @@ const ChartComponent = _ref18 => {
     exportColumns,
     exportPercentUnit,
     hideExportActions = false
-  } = _ref18;
+  } = _ref20;
   const coloredData = useMemo(() => MetricColors.chartData(data, type), [data, type]);
   const canvasRef = useRef(null),
     chartInstance = useRef(null);
@@ -2285,7 +2434,7 @@ const ChartComponent = _ref18 => {
 };
 
 // Componente: alterna entre Pizza, Barras e Tabela com seletor financeiro.
-function ToggleableChartCard(_ref19) {
+function ToggleableChartCard(_ref21) {
   var _title$match;
   let {
     title,
@@ -2294,7 +2443,7 @@ function ToggleableChartCard(_ref19) {
     id,
     isFornecedor,
     subjectLabel: subjectLabelProp
-  } = _ref19;
+  } = _ref21;
   const [viewMode, setViewMode] = useState('pie');
   const [finMetric, setFinMetric] = useState('total');
   const [tableSort, setTableSort] = useState({
@@ -2750,18 +2899,18 @@ function ToggleableChartCard(_ref19) {
     exportTitle: displayTitle
   }))));
 }
-function ChartTableToggle(_ref20) {
+function ChartTableToggle(_ref22) {
   let {
     isTable,
     onToggle
-  } = _ref20;
+  } = _ref22;
   return /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: onToggle,
     className: "rounded border border-blue-200 bg-blue-50 px-3 py-1.5 text-[9px] font-black uppercase tracking-widest text-blue-600 shadow-sm transition hover:bg-blue-100"
   }, isTable ? '▥ GRÁFICO' : '▦ TABELA');
 }
-function SortableChartTable(_ref21) {
+function SortableChartTable(_ref23) {
   var _columns$;
   let {
     id,
@@ -2769,7 +2918,7 @@ function SortableChartTable(_ref21) {
     rows,
     columns,
     initialSortKey
-  } = _ref21;
+  } = _ref23;
   const [sort, setSort] = useState({
     key: initialSortKey || ((_columns$ = columns[0]) === null || _columns$ === void 0 ? void 0 : _columns$.key),
     direction: 'desc'
@@ -2796,14 +2945,18 @@ function SortableChartTable(_ref21) {
     if (column.isCurrency) return formatBRL(value);
     if (column.isPercent) return formatPercentBR(value);
     if (typeof value === 'number') return value.toLocaleString('pt-BR');
-    return value;
+    return /*#__PURE__*/React.createElement(PortalDocumentTableValue, {
+      value: value,
+      row: row,
+      field: column.key
+    });
   };
-  const exportColumns = columns.map(_ref22 => {
+  const exportColumns = columns.map(_ref24 => {
     let {
       render,
       sortValue,
       ...column
-    } = _ref22;
+    } = _ref24;
     return column;
   });
   return /*#__PURE__*/React.createElement("div", {
@@ -2847,7 +3000,7 @@ function SortableChartTable(_ref21) {
     title: columnIndex === 0 ? row._tooltip || String(row[column.key] || '') : undefined
   }, displayValue(row, column)))))))));
 }
-function KPICard(_ref23) {
+function KPICard(_ref25) {
   let {
     title,
     value,
@@ -2858,7 +3011,7 @@ function KPICard(_ref23) {
     color,
     isCurrency,
     subLabel = "do Empenhado"
-  } = _ref23;
+  } = _ref25;
   const colors = {
     slate: "border-slate-800 text-slate-800",
     blue: "border-blue-500 text-blue-700",
@@ -2899,7 +3052,7 @@ function KPICard(_ref23) {
     className: "text-[10px] font-bold opacity-70 mt-1"
   }, formatPercentBR(subValue), " ", subLabel), renderExtraText()));
 }
-function TextHeader(_ref24) {
+function TextHeader(_ref26) {
   let {
     label,
     field,
@@ -2909,7 +3062,7 @@ function TextHeader(_ref24) {
     searchVal,
     onSearchChange,
     widthClass
-  } = _ref24;
+  } = _ref26;
   const isSorted = current.key === field;
   return /*#__PURE__*/React.createElement("th", {
     className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -2930,7 +3083,7 @@ function TextHeader(_ref24) {
     className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   }));
 }
-function NumericHeader(_ref25) {
+function NumericHeader(_ref27) {
   let {
     label,
     field,
@@ -2940,7 +3093,7 @@ function NumericHeader(_ref25) {
     setNumFilters,
     align = "left",
     widthClass
-  } = _ref25;
+  } = _ref27;
   const isSorted = current.key === field;
   const filterMin = numFilters[field] ? numFilters[field].min : '';
   const filterMax = numFilters[field] ? numFilters[field].max : '';
@@ -2999,7 +3152,7 @@ function NumericHeader(_ref25) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function DateFilterHeader(_ref26) {
+function DateFilterHeader(_ref28) {
   let {
     label,
     field,
@@ -3009,7 +3162,7 @@ function DateFilterHeader(_ref26) {
     setDateFilters,
     align = "left",
     widthClass
-  } = _ref26;
+  } = _ref28;
   const isSorted = current.key === field;
   const filterMin = dateFilters[field] ? dateFilters[field].min : '';
   const filterMax = dateFilters[field] ? dateFilters[field].max : '';
@@ -3060,13 +3213,13 @@ function DateFilterHeader(_ref26) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function MultiSelect(_ref27) {
+function MultiSelect(_ref29) {
   let {
     label,
     options,
     selected,
     onChange
-  } = _ref27;
+  } = _ref29;
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef();
@@ -3132,12 +3285,12 @@ function MultiSelect(_ref27) {
     title: o
   }, o))))));
 }
-function DateInput(_ref28) {
+function DateInput(_ref30) {
   let {
     label,
     value,
     onChange
-  } = _ref28;
+  } = _ref30;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
   }, label), /*#__PURE__*/React.createElement("input", {
@@ -3202,14 +3355,14 @@ function AccessMetadata() {
     className: "italic"
   }, "Produzido por Cel Brito"));
 }
-function CollapsibleSection(_ref29) {
+function CollapsibleSection(_ref31) {
   let {
     title,
     children,
     defaultOpen = false,
     globalTrigger,
     globalState
-  } = _ref29;
+  } = _ref31;
   const [isOpen, setIsOpen] = useState(defaultOpen);
   useEffect(() => {
     if (globalTrigger > 0) setIsOpen(globalState);
@@ -3340,20 +3493,20 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     document.addEventListener('mouseup', onMouseUp);
   };
   const exportTable = sharedExports;
-  const FormatNegativeValue = _ref30 => {
+  const FormatNegativeValue = _ref32 => {
     let {
       val
-    } = _ref30;
+    } = _ref32;
     if (val === null || val === undefined) return /*#__PURE__*/React.createElement("span", null, "-");
     const isNegative = val < -0.001;
     return /*#__PURE__*/React.createElement("span", {
       className: isNegative ? "underline decoration-red-500 decoration-[2px] underline-offset-2" : ""
     }, formatBRL(val));
   };
-  const ContratoCell = _ref31 => {
+  const ContratoCell = _ref33 => {
     let {
       row
-    } = _ref31;
+    } = _ref33;
     return /*#__PURE__*/React.createElement("div", {
       className: "flex flex-col"
     }, /*#__PURE__*/React.createElement("span", {
@@ -3364,14 +3517,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "text-[8px] text-slate-500 leading-tight whitespace-normal break-words"
     }, "Mod: ", row.modalidade));
   };
-  function CollapsibleSection(_ref32) {
+  function CollapsibleSection(_ref34) {
     let {
       title,
       children,
       defaultOpen = false,
       globalTrigger,
       globalState
-    } = _ref32;
+    } = _ref34;
     const [isOpen, setIsOpen] = useState(defaultOpen);
     useEffect(() => {
       if (globalTrigger > 0) setIsOpen(globalState);
@@ -3391,11 +3544,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-6"
     }, children));
   }
-  function AutoFitText(_ref33) {
+  function AutoFitText(_ref35) {
     let {
       text,
       className
-    } = _ref33;
+    } = _ref35;
     const containerRef = useRef(null);
     const textRef = useRef(null);
     useEffect(() => {
@@ -3423,12 +3576,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     }, text));
   }
   const ChartComponent = sharedChart;
-  function DocumentComposition(_ref34) {
+  function DocumentComposition(_ref36) {
     let {
       counts,
       amounts,
       uniqueDocs
-    } = _ref34;
+    } = _ref36;
     const canvasRef = useRef(null);
     const rows = useMemo(() => {
       const stages = [{
@@ -3625,7 +3778,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       role: "img"
     })));
   }
-  function LatestDocCard(_ref35) {
+  function LatestDocCard(_ref37) {
     var _MetricColors$get2;
     let {
       title,
@@ -3633,7 +3786,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       metricField,
       colorClass,
       showEmitente
-    } = _ref35;
+    } = _ref37;
     const first = docs === null || docs === void 0 ? void 0 : docs[0];
     const totalValue = useMemo(() => (docs || []).reduce((sum, doc) => sum + (doc[metricField] || 0), 0), [docs, metricField]);
     const daysText = useMemo(() => {
@@ -3682,13 +3835,16 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     }))), /*#__PURE__*/React.createElement("div", {
       className: "break-words text-[10px] font-bold text-slate-700",
       title: `Favorecido: ${doc.favorecido || 'N/I'} | Objeto: ${doc.objeto || '-'}`
-    }, doc.documento, " ", /*#__PURE__*/React.createElement("span", {
+    }, /*#__PURE__*/React.createElement(PortalDocumentLink, {
+      value: doc.documento,
+      context: doc
+    }), " ", /*#__PURE__*/React.createElement("span", {
       className: "text-[9px] text-slate-400"
     }, "(", doc.contrato, ")")), showEmitente && /*#__PURE__*/React.createElement("div", {
       className: "break-words text-[9px] font-bold text-slate-500"
     }, doc.ug))))));
   }
-  function TextHeader(_ref36) {
+  function TextHeader(_ref38) {
     let {
       label,
       field,
@@ -3698,7 +3854,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       searchVal,
       onSearchChange,
       widthClass
-    } = _ref36;
+    } = _ref38;
     const isSorted = current.key === field;
     return /*#__PURE__*/React.createElement("th", {
       className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -3719,7 +3875,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     }));
   }
-  function NumericHeader(_ref37) {
+  function NumericHeader(_ref39) {
     let {
       label,
       field,
@@ -3729,7 +3885,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setNumFilters,
       align = "left",
       widthClass
-    } = _ref37;
+    } = _ref39;
     const isSorted = current.key === field;
     const handleMin = e => setNumFilters(p => ({
       ...p,
@@ -3774,7 +3930,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function DateFilterHeader(_ref38) {
+  function DateFilterHeader(_ref40) {
     let {
       label,
       field,
@@ -3784,7 +3940,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setDateFilters,
       align = "left",
       widthClass
-    } = _ref38;
+    } = _ref40;
     const isSorted = current.key === field;
     const handleMin = e => setDateFilters(p => ({
       ...p,
@@ -3827,13 +3983,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function MultiSelect(_ref39) {
+  function MultiSelect(_ref41) {
     let {
       label,
       options,
       selected,
       onChange
-    } = _ref39;
+    } = _ref41;
     const [isOpen, setIsOpen] = useState(false);
     const [search, setSearch] = useState("");
     const ref = useRef();
@@ -3897,12 +4053,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "truncate leading-tight"
     }, o))))));
   }
-  function DateInput(_ref40) {
+  function DateInput(_ref42) {
     let {
       label,
       value,
       onChange
-    } = _ref40;
+    } = _ref42;
     return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
       className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
     }, label), /*#__PURE__*/React.createElement("input", {
@@ -3912,7 +4068,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-sm cursor-pointer"
     }));
   }
-  function KPICard(_ref41) {
+  function KPICard(_ref43) {
     let {
       title,
       value,
@@ -3922,7 +4078,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       color,
       isCurrency,
       extraText
-    } = _ref41;
+    } = _ref43;
     const colors = {
       slate: "border-slate-800 text-slate-800",
       blue: "border-blue-500 text-blue-700",
@@ -3956,13 +4112,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       key: idx
     }, line)))));
   }
-  function DocStatCard(_ref42) {
+  function DocStatCard(_ref44) {
     let {
       title,
       count,
       date,
       timestamp
-    } = _ref42;
+    } = _ref44;
     const daysText = useMemo(() => {
       if (!timestamp) return '';
       const today = new Date();
@@ -3987,7 +4143,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // COMPONENTE: SUBTABELA DETALHADA
   // =========================================================
-  function SubTable(_ref43) {
+  function SubTable(_ref45) {
     let {
       title,
       data,
@@ -3997,7 +4153,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       rowBgColor,
       textColor,
       showDiasAss = false
-    } = _ref43;
+    } = _ref45;
     const [limit, setLimit] = useState(100);
     const [sortConfig, setSortConfig] = useState({
       key: 'diaVal',
@@ -4500,9 +4656,15 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: `text-[8px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${row.existencia === 'AMBAS' ? 'bg-blue-100 text-blue-700 border border-blue-200' : row.existencia === 'GERAL' ? 'bg-amber-100 text-amber-800 border border-amber-200' : 'bg-orange-100 text-orange-800 border border-orange-200'}`
     }, row.existencia)), visibleCols.empenho && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-600 font-bold whitespace-normal break-words"
-    }, row.empenho), visibleCols.documento && /*#__PURE__*/React.createElement("td", {
+    }, row.empenho && /*#__PURE__*/React.createElement(PortalDocumentLink, {
+      value: row.empenho,
+      context: row
+    })), visibleCols.documento && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-600 font-bold whitespace-normal break-words"
-    }, row.documento), visibleCols.obs && /*#__PURE__*/React.createElement("td", {
+    }, row.documento && /*#__PURE__*/React.createElement(PortalDocumentLink, {
+      value: row.documento,
+      context: row
+    })), visibleCols.obs && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-500 whitespace-normal break-words leading-tight"
     }, row.obs), visibleCols.metricas && /*#__PURE__*/React.createElement("td", {
       className: `p-2 text-right font-black whitespace-normal break-words ${textColor} ${rowBgColor}`,
@@ -4534,7 +4696,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // DASHBOARD MASTER CONTÁBIL
   // =========================================================
-  function useDashboard(_ref44) {
+  function useDashboard(_ref46) {
     let {
       payload,
       shared,
@@ -4543,7 +4705,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       globalExpandState,
       expandTrigger,
       resetRevision
-    } = _ref44;
+    } = _ref46;
     const [rawData, setRawData] = useState([]);
     const [processedPayload, setProcessedPayload] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -5055,6 +5217,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         if (!row || row.length === 0) continue;
         const dia = getVC(["Emissão - Dia Data Completa", "Emissao"], ["emissao", "dia", "data"], row);
         const ug = getVC(["Emitente - UG Código", "UG Codigo"], ["ug codigo", "emitente"], row).toUpperCase();
+        const portalUg = ["Emitente - UG Código", "Emitente - UG Codigo", "UG Emitente Código", "UG Emitente Codigo", "UG Emitente", "UG Código", "UG Codigo"].map(name => getVC([name], [], row)).find(value => /^\d{1,6}$/.test(String(value || "").trim())) || "";
+        const gestao = ["Emitente - Gestão Código", "Emitente - Gestao Codigo", "Emitente - Gestão", "Emitente - Gestao", "UG Emitente - Gestão Código", "UG Emitente - Gestao Codigo", "Gestão Código", "Gestao Codigo", "Gestão", "Gestao"].map(name => getVC([name], [], row)).find(value => /^\d{1,5}$/.test(String(value || "").trim())) || "";
         const fav = getVC(["Favorecido Doc. Nome", "Favorecido"], ["favorecido", "doc. nome"], row).toUpperCase();
         const favCnpj = getFornecedorCnpj(fav) || ["Favorecido Doc. Código", "Favorecido Doc. Codigo", "Favorecido Doc. CNPJ", "Favorecido CNPJ", "CNPJ Favorecido"].map(name => getFornecedorCnpj(getVC([name], [], row))).find(Boolean) || "";
         const empenho = getVC(["Documento CCor Número"], ["ccor", "empenho"], row).toUpperCase();
@@ -5079,7 +5243,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         }
         const valor = parseValue(valStr);
         const diaVal = parseDateBR(dia) ? parseDateBR(dia).getTime() : 0;
-        const key = `${dia}|${ug}|${fav}|${favCnpj}|${empenho}|${doc}|${contrato}`;
+        const key = `${dia}|${ug}|${gestao}|${fav}|${favCnpj}|${empenho}|${doc}|${contrato}`;
         if (doc.includes("RO") && diaVal > 0 && contrato !== "-") {
           const keyRE = `${UnifiedData.key(contrato)}|${UnifiedData.key(empenho)}`;
           if (!minRoDict[keyRE] || diaVal < minRoDict[keyRE]) minRoDict[keyRE] = diaVal;
@@ -5091,6 +5255,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             dia,
             diaVal,
             ug,
+            gestao,
+            portal_ug: portalUg,
+            portal_contexts: [{
+              ug: portalUg,
+              gestao
+            }],
             favorecido: fav,
             favorecido_cnpj: favCnpj,
             empenho,
@@ -6118,6 +6288,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             compra: meta.compra,
             modalidade: meta.modalidade,
             empenho: meta.empenho,
+            portal_contexts: new Map(),
             favorecido: meta.favorecido,
             objeto: meta.objeto,
             nd_codigo: meta.nd_codigo,
@@ -6138,6 +6309,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           });
         }
         const m = map.get(key);
+        const matrixContexts = Object.prototype.hasOwnProperty.call(item, "portal_contexts") ? Array.isArray(item.portal_contexts) && item.portal_contexts.length ? item.portal_contexts : [{}] : [{
+          ug: item.portal_ug ?? item.ug,
+          gestao: item.gestao
+        }];
+        matrixContexts.forEach(context => m.portal_contexts.set(JSON.stringify(context), {
+          ...context
+        }));
         if (item.dtInicVal && (!m.dtInicVal || item.dtInicVal < m.dtInicVal)) {
           m.dtInicVal = item.dtInicVal;
         }
@@ -6170,6 +6348,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           compra: m.compra,
           modalidade: m.modalidade,
           empenho: m.empenho,
+          portal_contexts: [...m.portal_contexts.values()],
           favorecido: m.favorecido,
           objeto: m.objeto,
           nd_codigo: m.nd_codigo,
@@ -6828,7 +7007,10 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         row: row
       })), matrixShowsEmpenho && /*#__PURE__*/React.createElement("td", {
         className: "p-3 font-bold text-slate-600 break-words text-center whitespace-nowrap"
-      }, row.empenho), matrixShowsFavorecido && /*#__PURE__*/React.createElement("td", {
+      }, /*#__PURE__*/React.createElement(PortalDocumentLink, {
+        value: row.empenho,
+        context: row
+      })), matrixShowsFavorecido && /*#__PURE__*/React.createElement("td", {
         className: "p-3 font-bold text-slate-700 break-words min-w-[180px]"
       }, row.favorecido), matrixShowsObjeto && /*#__PURE__*/React.createElement("td", {
         className: "p-3 text-slate-600 break-words min-w-[240px]"
@@ -7304,9 +7486,15 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         title: "Fiscal"
       }, "F: ", row.fiscal)), masterCols.empenho && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-600 font-bold whitespace-normal break-words"
-      }, row.empenho), masterCols.documento && /*#__PURE__*/React.createElement("td", {
+      }, row.empenho && /*#__PURE__*/React.createElement(PortalDocumentLink, {
+        value: row.empenho,
+        context: row
+      })), masterCols.documento && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-600 font-bold whitespace-normal break-words"
-      }, row.documento), masterCols.obs && /*#__PURE__*/React.createElement("td", {
+      }, row.documento && /*#__PURE__*/React.createElement(PortalDocumentLink, {
+        value: row.documento,
+        context: row
+      })), masterCols.obs && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-500 whitespace-normal break-words leading-tight"
       }, row.obs), masterCols.v_emp && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-right font-bold text-blue-700 whitespace-normal break-words bg-blue-50/30",
@@ -7780,22 +7968,167 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     useDashboard
   };
 })(exportTable, ChartComponent);
+const DashboardPages = Object.freeze([{
+  id: 1,
+  label: 'PÁGINA 1',
+  detail: 'Estatísticas'
+}, {
+  id: 2,
+  label: 'PÁGINA 2',
+  detail: 'Gráficos'
+}, {
+  id: 3,
+  label: 'PÁGINA 3',
+  detail: 'Tabelas'
+}, {
+  id: 4,
+  label: 'PÁGINA 4',
+  detail: 'Panorama dos documentos'
+}, {
+  id: 5,
+  label: 'PÁGINA 5',
+  detail: 'Tabelas dos documentos'
+}]);
+function PageNavigation(_ref47) {
+  let {
+    activePage,
+    onPageChange
+  } = _ref47;
+  const [isOpen, setIsOpen] = useState(false);
+  const triggerRef = useRef(null),
+    panelRef = useRef(null);
+  const current = DashboardPages.find(page => page.id === activePage) || DashboardPages[0];
+  const close = React.useCallback(() => setIsOpen(false), []);
+  useEffect(() => {
+    if (!isOpen || !panelRef.current) return;
+    const panel = panelRef.current,
+      returnTarget = document.activeElement;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusable = () => Array.from(panel.querySelectorAll('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'));
+    (panel.querySelector('[aria-current="page"]') || focusable()[0] || panel).focus();
+    const keydown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = focusable(),
+        first = controls[0],
+        last = controls[controls.length - 1];
+      if (!first) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      if (!panel.contains(document.activeElement) || !event.shiftKey && document.activeElement === last || event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+    document.addEventListener('keydown', keydown, true);
+    return () => {
+      document.removeEventListener('keydown', keydown, true);
+      document.body.style.overflow = previousOverflow;
+      const target = returnTarget !== null && returnTarget !== void 0 && returnTarget.isConnected ? returnTarget : triggerRef.current;
+      target === null || target === void 0 || target.focus();
+    };
+  }, [isOpen, close]);
+  const selectPage = page => {
+    onPageChange(page.id);
+    close();
+  };
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+    ref: triggerRef,
+    type: "button",
+    onClick: () => setIsOpen(true),
+    "aria-expanded": isOpen,
+    "aria-controls": "dashboard-page-navigation",
+    "aria-haspopup": "dialog",
+    "aria-label": `Abrir menu de páginas. Página atual: ${current.label}, ${current.detail}`,
+    title: "Abrir menu de p\xE1ginas",
+    className: "fixed left-0 top-1/2 z-40 -translate-y-1/2 rounded-r-xl border border-l-0 border-blue-700 bg-blue-700 px-2.5 py-4 text-white shadow-lg transition hover:bg-blue-800 focus-visible:outline focus-visible:outline-4 focus-visible:outline-offset-2 focus-visible:outline-blue-500",
+    style: {
+      writingMode: 'vertical-rl'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    "aria-hidden": "true",
+    className: "mb-2 text-lg"
+  }, "\u2630"), /*#__PURE__*/React.createElement("span", {
+    className: "text-[11px] font-black tracking-widest"
+  }, "P\xC1GINAS")), /*#__PURE__*/React.createElement("div", {
+    hidden: !isOpen,
+    className: "fixed inset-0 z-[80] bg-slate-950/50",
+    onMouseDown: event => {
+      if (event.target === event.currentTarget) close();
+    }
+  }, /*#__PURE__*/React.createElement("section", {
+    id: "dashboard-page-navigation",
+    ref: panelRef,
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "dashboard-page-navigation-title",
+    "aria-describedby": "dashboard-page-navigation-help",
+    tabIndex: -1,
+    className: "absolute inset-y-0 left-0 flex max-h-screen flex-col border-r border-slate-200 bg-white shadow-2xl",
+    style: {
+      width: 'min(22rem, calc(100vw - 1rem))',
+      height: '100dvh'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex shrink-0 items-start justify-between gap-3 border-b border-slate-200 p-5"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    id: "dashboard-page-navigation-title",
+    className: "text-base font-black text-slate-800"
+  }, "Navegar pelas p\xE1ginas"), /*#__PURE__*/React.createElement("p", {
+    id: "dashboard-page-navigation-help",
+    className: "mt-1 text-xs text-slate-500"
+  }, "Escolha uma p\xE1gina. Esc fecha este menu.")), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: close,
+    "aria-label": "Fechar menu de p\xE1ginas",
+    className: "rounded-lg px-3 py-2 text-lg font-bold text-slate-500 hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600"
+  }, "\xD7")), /*#__PURE__*/React.createElement("nav", {
+    className: "min-h-0 flex-1 overflow-y-auto p-4",
+    "aria-label": "P\xE1ginas do dashboard"
+  }, /*#__PURE__*/React.createElement("ul", {
+    className: "flex flex-col gap-2"
+  }, DashboardPages.map(page => /*#__PURE__*/React.createElement("li", {
+    key: page.id
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: () => selectPage(page),
+    className: `w-full rounded-xl border px-4 py-4 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${activePage === page.id ? 'border-blue-700 bg-blue-700 text-white shadow-md' : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'}`,
+    "aria-current": activePage === page.id ? 'page' : undefined
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "block text-[11px] font-black tracking-widest"
+  }, page.label), /*#__PURE__*/React.createElement("span", {
+    className: `mt-1 block text-xs font-bold ${activePage === page.id ? 'text-blue-100' : 'text-slate-500'}`
+  }, page.detail)))))))), /*#__PURE__*/React.createElement("span", {
+    className: "sr-only",
+    role: "status",
+    "aria-live": "polite",
+    "aria-atomic": "true"
+  }, current.label, ": ", current.detail));
+}
 function Dashboard() {
   const [rawData, setRawData] = useState([]);
   const [apiPayload, setApiPayload] = useState(null);
   const [linkDiagnostics, setLinkDiagnostics] = useState(null);
   const [resetRevision, setResetRevision] = useState(0);
   const loadingRef = useRef(false);
-  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV4') === '1');
+  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV5') === '1');
   const closeSummary = React.useCallback(() => {
-    sessionStorage.removeItem('summary_pending_TotalV4');
+    sessionStorage.removeItem('summary_pending_TotalV5');
     setSummaryRequested(false);
   }, []);
   const [activePage, setActivePage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("A verificar sessão local...");
-  const currentUser = sessionStorage.getItem('user_TotalV4') || 'Usuário';
-  const currentPerfil = sessionStorage.getItem('perfil_TotalV4') || '';
+  const currentUser = sessionStorage.getItem('user_TotalV5') || 'Usuário';
+  const currentPerfil = sessionStorage.getItem('perfil_TotalV5') || '';
 
   // Estado de Expansão Global das seções
   const [globalExpandState, setGlobalExpandState] = useState(false);
@@ -8218,7 +8551,7 @@ function Dashboard() {
     clearAuthStorage();
     try {
       localStorage.removeItem(DASH_CACHE_KEY);
-      localStorage.removeItem('dashData_TotalV4');
+      localStorage.removeItem('dashData_TotalV5');
     } catch (e) {}
     window.location.reload();
   };
@@ -8486,8 +8819,8 @@ function Dashboard() {
     const headers = rowsArray[0];
     const normalizedHeaders = headers.map(normalizeStr);
     const headerIndices = new Map(normalizedHeaders.map((value, index) => [value, index]));
-    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref45 => {
-      let [contract, totals] = _ref45;
+    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref48 => {
+      let [contract, totals] = _ref48;
       return [contract, totals.v_recebido];
     }));
     const receivedAssigned = new Set();
@@ -8534,8 +8867,8 @@ function Dashboard() {
       const receivedKey = normalizeContractKey(contrato);
       const v_recebido = receivedAssigned.has(receivedKey) ? 0 : recebidoByContrato[receivedKey] || 0;
       receivedAssigned.add(receivedKey);
-      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref46 => {
-        let [key] = _ref46;
+      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref49 => {
+        let [key] = _ref49;
         return normalizeContractKey(key) === normalizeContractKey(contrato);
       })) === null || _Object$entries$find === void 0 ? void 0 : _Object$entries$find[1]) || emptyOrcamentario();
       const v_a_liquidar = v_empenhado - v_liquidado - v_cancelado - v_bloqueado;
@@ -8588,9 +8921,9 @@ function Dashboard() {
       };
     }).filter(r => r.contrato !== "-");
     const canonicalIndex = ContractRules.contractIndex(mappedRaw);
-    const canonicalClassifications = new Map([...canonicalIndex].map(_ref47 => {
+    const canonicalClassifications = new Map([...canonicalIndex].map(_ref50 => {
       var _ledgerIndex$get;
-      let [id, entry] = _ref47;
+      let [id, entry] = _ref50;
       return [id, ContractRules.classify(entry.totals, entry.metadata, (_ledgerIndex$get = ledgerIndex.get(id)) === null || _ledgerIndex$get === void 0 ? void 0 : _ledgerIndex$get.hasMovement, hoje)];
     }));
 
@@ -8637,7 +8970,7 @@ function Dashboard() {
     }
     try {
       setStatus("A transferir dados via Api...");
-      const token = sessionStorage.getItem('token_TotalV4');
+      const token = sessionStorage.getItem('token_TotalV5');
       if (!token) throw new Error("Token de acesso não encontrado. Faça login novamente.");
       const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}`);
       const json = await readAppsScriptJson(response, 'a sincronização dos dados');
@@ -8713,8 +9046,8 @@ function Dashboard() {
       nd_subelemento_filter_values: 'nd_subelemento_filter_values'
     };
     documentDashboard.budgetIndex.byContract.forEach(details => details.forEach(detail => {
-      Object.entries(budgetOptionsMap).forEach(_ref48 => {
-        let [field, property] = _ref48;
+      Object.entries(budgetOptionsMap).forEach(_ref51 => {
+        let [field, property] = _ref51;
         const values = Array.isArray(detail[property]) ? detail[property] : splitBudgetDimensionValue(detail[property]);
         values.forEach(value => {
           if (value && value !== '-' && value !== 'N/I') accumulators[field].add(value);
@@ -10174,51 +10507,27 @@ function Dashboard() {
     className: "flex flex-wrap gap-3 items-center bg-white px-5 py-3 rounded-xl border border-slate-200 shadow-sm max-w-full"
   }, /*#__PURE__*/React.createElement(AccessMetadata, null), /*#__PURE__*/React.createElement("div", {
     className: "w-[1px] h-8 bg-slate-300 mx-1 hidden md:block shrink-0"
-  }), /*#__PURE__*/React.createElement("button", {
-    onClick: () => loadData(true, null),
-    className: "text-[11px] font-black text-white bg-blue-600 px-4 py-3 rounded-lg shadow hover:bg-blue-700 transition uppercase tracking-wider whitespace-nowrap shrink-0"
-  }, "SINCRONIZAR APIs"), /*#__PURE__*/React.createElement("span", {
+  }), /*#__PURE__*/React.createElement("span", {
     className: "text-[11px] font-black text-slate-500 uppercase whitespace-nowrap ml-1 shrink-0"
   }, "LOGADO COMO: ", /*#__PURE__*/React.createElement("span", {
     className: "text-blue-600"
   }, String(currentUser || 'Usuário').toUpperCase()), currentPerfil && /*#__PURE__*/React.createElement("span", {
     className: "text-slate-400"
-  }, " (", String(currentPerfil).toUpperCase(), ")")), /*#__PURE__*/React.createElement("button", {
+  }, " (", String(currentPerfil).toUpperCase(), ")")), /*#__PURE__*/React.createElement("div", {
+    className: "flex max-w-full flex-wrap items-center gap-2",
+    "aria-label": "A\xE7\xF5es da sess\xE3o"
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: () => loadData(true, null),
+    className: "text-[11px] font-black text-white bg-blue-600 px-4 py-3 rounded-lg shadow hover:bg-blue-700 transition uppercase tracking-wider whitespace-nowrap shrink-0"
+  }, "SINCRONIZAR APIs"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
     onClick: logout,
     className: "text-[11px] font-black text-white bg-red-600 px-4 py-3 rounded-lg shadow hover:bg-red-700 transition uppercase tracking-wider whitespace-nowrap shrink-0"
-  }, "SAIR"))), /*#__PURE__*/React.createElement("nav", {
-    className: "max-w-[1600px] mx-auto mb-6 grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-2 bg-white p-2 rounded-2xl shadow-sm border border-slate-200",
-    "aria-label": "P\xE1ginas do dashboard"
-  }, [{
-    id: 1,
-    label: 'PÁGINA 1',
-    detail: 'Estatísticas'
-  }, {
-    id: 2,
-    label: 'PÁGINA 2',
-    detail: 'Gráficos'
-  }, {
-    id: 3,
-    label: 'PÁGINA 3',
-    detail: 'Tabelas'
-  }, {
-    id: 4,
-    label: 'PÁGINA 4',
-    detail: 'Panorama dos documentos'
-  }, {
-    id: 5,
-    label: 'PÁGINA 5',
-    detail: 'Tabelas dos documentos'
-  }].map(page => /*#__PURE__*/React.createElement("button", {
-    key: page.id,
-    onClick: () => setActivePage(page.id),
-    className: `px-4 py-3 rounded-xl text-left transition border ${activePage === page.id ? 'bg-blue-700 text-white border-blue-700 shadow-md' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`,
-    "aria-current": activePage === page.id ? 'page' : undefined
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "block text-[11px] font-black tracking-widest"
-  }, page.label), /*#__PURE__*/React.createElement("span", {
-    className: `block text-[9px] font-bold mt-0.5 ${activePage === page.id ? 'text-blue-100' : 'text-slate-400'}`
-  }, page.detail)))), /*#__PURE__*/React.createElement(CollapsibleSection, {
+  }, "SAIR")))), /*#__PURE__*/React.createElement(PageNavigation, {
+    activePage: activePage,
+    onPageChange: setActivePage
+  }), /*#__PURE__*/React.createElement(CollapsibleSection, {
     title: "FILTROS DIN\xC2MICOS (INTEGRADOS)",
     defaultOpen: true,
     globalTrigger: expandTrigger,
@@ -10279,8 +10588,8 @@ function Dashboard() {
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVencidos30Active ? 'bg-red-700 text-white border-red-700 ring-2 ring-red-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VENCIDOS H\xC1 30 DIAS")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
-  }, Object.entries(tagColorsMap).map(_ref49 => {
-    let [label, config] = _ref49;
+  }, Object.entries(tagColorsMap).map(_ref52 => {
+    let [label, config] = _ref52;
     const isActive = fSituacaoTags.includes(label);
     return /*#__PURE__*/React.createElement("button", {
       key: label,
@@ -12798,7 +13107,7 @@ class ErrorBoundary extends React.Component {
       onClick: () => {
         clearAuthStorage();
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV4');
+        localStorage.removeItem('dashData_TotalV5');
         window.location.reload();
       },
       className: "bg-red-600 text-white px-6 py-3 rounded shadow font-bold hover:bg-red-700"
@@ -12832,17 +13141,17 @@ function App() {
         setIsLogging(false);
         return;
       }
-      sessionStorage.setItem('token_TotalV4', json.token);
-      sessionStorage.setItem('summary_pending_TotalV4', '1');
-      sessionStorage.setItem('user_TotalV4', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
-      sessionStorage.setItem('perfil_TotalV4', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
-      sessionStorage.setItem('ativo_TotalV4', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
-      sessionStorage.setItem('validade_TotalV4', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
-      sessionStorage.setItem('duracao_diaria_horas_TotalV4', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
-      sessionStorage.setItem('expira_TotalV4', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
+      sessionStorage.setItem('token_TotalV5', json.token);
+      sessionStorage.setItem('summary_pending_TotalV5', '1');
+      sessionStorage.setItem('user_TotalV5', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
+      sessionStorage.setItem('perfil_TotalV5', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
+      sessionStorage.setItem('ativo_TotalV5', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
+      sessionStorage.setItem('validade_TotalV5', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
+      sessionStorage.setItem('duracao_diaria_horas_TotalV5', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
+      sessionStorage.setItem('expira_TotalV5', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
       try {
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV4');
+        localStorage.removeItem('dashData_TotalV5');
       } catch (e) {}
       setIsAuthenticated(true);
       setIsLogging(false);
