@@ -1,4 +1,13 @@
-/* Shared conversion and joins for the consolidated dashboard. */
+/*
+ * Organização do JavaScript — as definições são carregadas antes do primeiro render.
+ * 1. Dados: normalização, leitura de colunas e índices de relacionamento.
+ * 2. Negócio: vigência, saldos canônicos, classificações e resumo autorizado.
+ * 3. Apresentação: cores, tooltips, plugins, formatação e links seguros.
+ * 4. Exportação e componentes reutilizáveis.
+ * 5. Documentos contábeis, navegação, painel de contratos e autenticação.
+ * A autorização e o consumo de cota permanecem no Code.gs.
+ */
+// 1. DADOS — conversões compartilhadas e índices recalculados por carga.
 const UnifiedData = (() => {
   const brlFormatter = new Intl.NumberFormat('pt-BR', {
     style: 'currency',
@@ -65,8 +74,8 @@ const UnifiedData = (() => {
     });
     return [...records.values()];
   };
-  const ndDimensionValues = detail => {
-    const parts = ndParts(detail);
+  const ndDimensionValues = function (detail) {
+    let parts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : ndParts(detail);
     const values = field => [...new Set(parts.map(part => part[field]).filter(Boolean))];
     return {
       nd_grupo_values: values('grupo'),
@@ -178,6 +187,45 @@ const UnifiedData = (() => {
       return !(filters[field] || []).length || filters[field].some(value => normalize(value) === part[property]);
     }));
   };
+  // Compile aliases once per loaded header. Resolution preserves the first
+  // exact header, alias order and first fuzzy match used by the V5 reader.
+  const compileReaders = function (headers, schema) {
+    let normalizer = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : normalize;
+    const normalizedHeaders = headers.map(normalizer),
+      exact = new Map();
+    normalizedHeaders.forEach((header, index) => {
+      if (!exact.has(header)) exact.set(header, index);
+    });
+    return Object.fromEntries(Object.entries(schema).map(_ref3 => {
+      let [field, spec] = _ref3;
+      let index = -1;
+      for (const name of spec.names) {
+        const alias = normalizer(name);
+        if (exact.has(alias)) {
+          index = exact.get(alias);
+          break;
+        }
+      }
+      if (index < 0) for (const name of spec.fallbacks || []) {
+        const alias = normalizer(name);
+        index = normalizedHeaders.findIndex(header => header.includes(alias));
+        if (index >= 0) break;
+      }
+      return [field, row => index < 0 ? '' : normalizer(row[index])];
+    }));
+  };
+  // Keep exact source keys first. The canonical fallback keeps the first
+  // matching object entry, as the previous Object.entries(...).find did.
+  const contractLookup = function (records) {
+    let normalizer = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : key;
+    const canonical = new Map();
+    Object.entries(records).forEach(_ref4 => {
+      let [contract, value] = _ref4;
+      const id = normalizer(contract);
+      if (!canonical.has(id)) canonical.set(id, value);
+    });
+    return contract => records[contract] || canonical.get(normalizer(contract));
+  };
   const budgetIndex = rows => {
     const byContract = new Map(),
       byCommitment = new Map();
@@ -185,41 +233,69 @@ const UnifiedData = (() => {
       byContract,
       byCommitment
     };
-    const headers = rows[0].map(normalize);
-    const read = function (row, names) {
-      let fallbacks = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [];
-      for (const name of names) {
-        const index = headers.indexOf(normalize(name));
-        if (index >= 0) return normalize(row[index]);
+    const read = compileReaders(rows[0], {
+      contract: {
+        names: ['COL_NR_CONTR_BASE', 'Contrato', 'Número Contrato', 'Numero Contrato'],
+        fallbacks: ['contr base', 'contrato']
+      },
+      commitment: {
+        names: ['Documento CCor Número', 'Documento CCor Numero', 'DOCUMENTO_CCOR_NUMERO'],
+        fallbacks: ['documento ccor']
+      },
+      ao_codigo: {
+        names: ['Ação Governo Código', 'AO Código', 'AO Codigo']
+      },
+      ao_nome: {
+        names: ['Ação Governo Nome', 'AO Nome']
+      },
+      po_codigo: {
+        names: ['Plano Orçamentário Código PO', 'PO Código', 'PO Codigo']
+      },
+      po_nome: {
+        names: ['Plano Orçamentário Nome', 'PO Nome']
+      },
+      pi_codigo: {
+        names: ['PI Código PI', 'PI Código', 'PI Codigo']
+      },
+      pi_nome: {
+        names: ['PI Nome']
+      },
+      nd_codigo: {
+        names: ['ND_DOC', 'ND Código', 'ND Codigo']
+      },
+      nd_nome: {
+        names: ['ND_NOME', 'ND Nome']
+      },
+      ug: {
+        names: ['Emitente - UG Código', 'Emitente - UG Codigo', 'UG Emitente', 'UG Código', 'UG Codigo']
+      },
+      ptres: {
+        names: ['PTRES Código', 'PTRES Codigo', 'PTRES']
       }
-      for (const name of fallbacks) {
-        const index = headers.findIndex(h => h.includes(normalize(name)));
-        if (index >= 0) return normalize(row[index]);
-      }
-      return '';
-    };
+    });
+    const pair = (name, code) => name && name !== 'N/I' && name !== '-' ? `${name} – ${code || 'N/I'}` : code;
     rows.slice(1).forEach(row => {
-      const contract = key(read(row, ['COL_NR_CONTR_BASE', 'Contrato', 'Número Contrato', 'Numero Contrato'], ['contr base', 'contrato']));
-      const commitment = key(read(row, ['Documento CCor Número', 'Documento CCor Numero', 'DOCUMENTO_CCOR_NUMERO'], ['documento ccor']));
+      const contract = key(read.contract(row));
+      const commitment = key(read.commitment(row));
       if (!contract) return;
       const detail = {
-        ao_codigo: read(row, ['Ação Governo Código', 'AO Código', 'AO Codigo']),
-        ao_nome: read(row, ['Ação Governo Nome', 'AO Nome']),
-        po_codigo: read(row, ['Plano Orçamentário Código PO', 'PO Código', 'PO Codigo']),
-        po_nome: read(row, ['Plano Orçamentário Nome', 'PO Nome']),
-        pi_codigo: read(row, ['PI Código PI', 'PI Código', 'PI Codigo']),
-        pi_nome: read(row, ['PI Nome']),
-        nd_codigo: read(row, ['ND_DOC', 'ND Código', 'ND Codigo']),
-        nd_nome: read(row, ['ND_NOME', 'ND Nome']),
-        ug: read(row, ['Emitente - UG Código', 'Emitente - UG Codigo', 'UG Emitente', 'UG Código', 'UG Codigo']),
-        ptres: read(row, ['PTRES Código', 'PTRES Codigo', 'PTRES'])
+        ao_codigo: read.ao_codigo(row),
+        ao_nome: read.ao_nome(row),
+        po_codigo: read.po_codigo(row),
+        po_nome: read.po_nome(row),
+        pi_codigo: read.pi_codigo(row),
+        pi_nome: read.pi_nome(row),
+        nd_codigo: read.nd_codigo(row),
+        nd_nome: read.nd_nome(row),
+        ug: read.ug(row),
+        ptres: read.ptres(row)
       };
-      const pair = (name, code) => name && name !== 'N/I' && name !== '-' ? `${name} – ${code || 'N/I'}` : code;
       detail.ao_filter = detail.ao_nome && detail.ao_nome !== 'N/I' && detail.ao_nome !== '-' ? `${detail.ao_codigo || 'N/I'} – ${detail.ao_nome}` : detail.ao_codigo;
       detail.po_filter = detail.po_nome && detail.po_nome !== 'N/I' && detail.po_nome !== '-' ? `${detail.po_codigo || 'N/I'} – ${detail.po_nome}` : detail.po_codigo;
       detail.pi_filter = pair(detail.pi_nome, detail.pi_codigo);
-      detail.nd_filter_values = ndParts(detail).map(part => pair(part.name, part.code));
-      Object.assign(detail, ndDimensionValues(detail));
+      const parts = ndParts(detail);
+      detail.nd_filter_values = parts.map(part => pair(part.name, part.code));
+      Object.assign(detail, ndDimensionValues(detail, parts));
       if (!byContract.has(contract)) byContract.set(contract, []);
       byContract.get(contract).push(detail);
       if (commitment) {
@@ -274,8 +350,83 @@ const UnifiedData = (() => {
     ndParts,
     ndDimensionValues,
     budgetDetailPortions,
-    aggregateCommitments
+    aggregateCommitments,
+    compileReaders,
+    contractLookup
   };
+})();
+
+// 2. REGRAS DE NEGÓCIO — somas por contrato, metadata da primeira linha e situações exclusivas.
+/* Authorized file URLs are read only from the first canonical Geral record. */
+const ContractFiles = (() => {
+  const fields = Object.freeze([Object.freeze({
+    key: 'diarios',
+    column: 'LINK_DIARIO',
+    label: 'DIÁRIOS'
+  }), Object.freeze({
+    key: 'docs',
+    column: 'LINK_DOC_EXEC',
+    label: 'DOCS'
+  }), Object.freeze({
+    key: 'relatorio',
+    column: 'LINK_REL_ACOMP',
+    label: 'RELATÓRIO'
+  }), Object.freeze({
+    key: 'dados',
+    column: 'LINK_DADOS_CONTR',
+    label: 'DADOS'
+  })]);
+  const empty = Object.freeze(Object.fromEntries(fields.map(field => [field.key, ''])));
+  const safeUrl = value => {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!/^https?:\/\//i.test(raw) || /[\u0000-\u0020\u007f\\]/.test(raw)) return '';
+    try {
+      const url = new URL(raw);
+      const host = url.hostname.replace(/\.$/, '');
+      const validHost = /^\[[0-9a-f:.]+\]$/i.test(host) || host && host.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+      return ['https:', 'http:'].includes(url.protocol) && validHost && !url.username && !url.password ? raw : '';
+    } catch (_) {
+      return '';
+    }
+  };
+  const index = rows => {
+    const result = new Map();
+    if (!Array.isArray(rows) || rows.length < 2) return result;
+    const headers = (rows[0] || []).map(UnifiedData.key);
+    const contractColumn = ['Número Contrato', 'Numero Contrato', 'Nº Contrato', 'N Contrato', 'Contrato', 'COL_NR_CONTR_BASE', 'numero_contrato'].map(UnifiedData.key).map(key => headers.indexOf(key)).find(index => index >= 0);
+    if (contractColumn === undefined) return result;
+    const columns = fields.map(field => headers.indexOf(UnifiedData.key(field.column)));
+    rows.slice(1).forEach(row => {
+      const rawContract = row === null || row === void 0 ? void 0 : row[contractColumn],
+        id = UnifiedData.key(rawContract);
+      if (!id || ['N/I', 'N/A'].includes(UnifiedData.normalize(rawContract)) || result.has(id)) return;
+      result.set(id, Object.freeze(Object.fromEntries(fields.map((field, i) => [field.key, safeUrl(columns[i] < 0 ? '' : row[columns[i]])]))));
+    });
+    return result;
+  };
+  const get = (row, key) => {
+    var _row$files;
+    return safeUrl(row === null || row === void 0 || (_row$files = row.files) === null || _row$files === void 0 ? void 0 : _row$files[key]);
+  };
+  const missingColumns = rows => {
+    if (!Array.isArray(rows) || !Array.isArray(rows[0])) return [];
+    const headers = new Set(rows[0].map(UnifiedData.key));
+    return fields.filter(field => !headers.has(UnifiedData.key(field.column))).map(field => field.column);
+  };
+  const exportColumns = () => fields.map(field => ({
+    header: `${field.label} (URL)`,
+    key: `files_${field.key}`,
+    format: row => get(row, field.key)
+  }));
+  return Object.freeze({
+    fields,
+    empty,
+    safeUrl,
+    index,
+    get,
+    missingColumns,
+    exportColumns
+  });
 })();
 const ContractRules = (() => {
   const cents = value => Math.round(UnifiedData.number(value) * 100);
@@ -356,8 +507,8 @@ const ContractRules = (() => {
       const id = UnifiedData.key(row.contrato);
       if (id && !firstRows.has(id)) firstRows.set(id, row);
     });
-    return [...contractIndex(rows)].map(_ref3 => {
-      let [id, entry] = _ref3;
+    return [...contractIndex(rows)].map(_ref5 => {
+      let [id, entry] = _ref5;
       const row = {
         ...firstRows.get(id),
         ...entry.metadata,
@@ -567,8 +718,8 @@ const ContractRules = (() => {
         count: row.count,
         value: row.valueCents / 100
       })),
-      movements: Object.fromEntries(Object.entries(movements).map(_ref4 => {
-        let [name, row] = _ref4;
+      movements: Object.fromEntries(Object.entries(movements).map(_ref6 => {
+        let [name, row] = _ref6;
         const documents = [...row.documents.values()].map(detail => {
           const dateValues = [...detail.dateValues].sort((a, b) => a - b),
             dates = dateValues.map(formatDate);
@@ -651,12 +802,12 @@ const ContractRules = (() => {
     accessText
   });
 })();
-function LoginSummaryModal(_ref5) {
+function LoginSummaryModal(_ref7) {
   let {
     summary,
     user,
     onClose
-  } = _ref5;
+  } = _ref7;
   const closeRef = useRef(null),
     dialogRef = useRef(null);
   useEffect(() => {
@@ -836,8 +987,8 @@ function LoginSummaryModal(_ref5) {
     className: "mb-3 text-xs text-slate-500"
   }, ContractRules.formatDate(p.recent7), " a ", ContractRules.formatDate(p.today), ", inclusive. Valores dos lan\xE7amentos do per\xEDodo."), /*#__PURE__*/React.createElement("div", {
     className: "grid gap-3 sm:grid-cols-2 xl:grid-cols-4"
-  }, [['empenhado', 'Empenhados'], ['recebido', 'Recebidos'], ['liquidado', 'Liquidados'], ['pago', 'Pagos']].map(_ref6 => {
-    let [metric, label] = _ref6;
+  }, [['empenhado', 'Empenhados'], ['recebido', 'Recebidos'], ['liquidado', 'Liquidados'], ['pago', 'Pagos']].map(_ref8 => {
+    let [metric, label] = _ref8;
     return /*#__PURE__*/React.createElement("div", {
       key: metric,
       className: "min-w-0 rounded-xl border-t-4 border border-slate-200 p-4",
@@ -855,7 +1006,7 @@ function LoginSummaryModal(_ref5) {
   }))));
 }
 
-// V3: one palette for the same financial metric across every page.
+// 3. APRESENTAÇÃO — mesma cor por métrica; OUTROS cinza nas barras e pizzas com escala térmica.
 const MetricColors = (() => {
   const palette = Object.freeze({
     global: Object.freeze({
@@ -1307,11 +1458,11 @@ const normalizeStr = str => {
   return str.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9%]/g, '');
 };
 
-// Implantação V1_GPT, compatível com o Code.gs orçamentário por documento CCor.
+// A API entrega somente as linhas autorizadas; a interface não amplia as permissões.
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwDf4gT-FPusNrbuXS0t-dE-LCLmqXmMVG7QX34GuQUHWc3EwjEargr1Mdi4DeXwpxf/exec";
-const DASH_CACHE_KEY = 'dashData_TotalV5_total_v5';
-const DASH_VERSION = 'V5';
-const AUTH_STORAGE_KEYS = ['summary_pending_TotalV5', 'token_TotalV5', 'user_TotalV5', 'perfil_TotalV5', 'ativo_TotalV5', 'validade_TotalV5', 'duracao_diaria_horas_TotalV5', 'expira_TotalV5'];
+const DASH_CACHE_KEY = 'dashData_TotalV6_total_v6';
+const DASH_VERSION = 'V6';
+const AUTH_STORAGE_KEYS = ['summary_pending_TotalV6', 'token_TotalV6', 'user_TotalV6', 'perfil_TotalV6', 'ativo_TotalV6', 'validade_TotalV6', 'duracao_diaria_horas_TotalV6', 'expira_TotalV6'];
 const clearAuthStorage = () => {
   try {
     AUTH_STORAGE_KEYS.forEach(key => sessionStorage.removeItem(key));
@@ -1319,9 +1470,9 @@ const clearAuthStorage = () => {
 };
 const isAuthSessionValid = () => {
   try {
-    const token = sessionStorage.getItem('token_TotalV5');
+    const token = sessionStorage.getItem('token_TotalV6');
     if (!token) return false;
-    const expiraEm = Number(sessionStorage.getItem('expira_TotalV5') || 0);
+    const expiraEm = Number(sessionStorage.getItem('expira_TotalV6') || 0);
     if (expiraEm && Date.now() > expiraEm) {
       clearAuthStorage();
       return false;
@@ -1381,12 +1532,73 @@ const counterpartyUrl = (name, identifier) => {
   const cnpj = getFornecedorCnpj(name) || getFornecedorCnpj(identifier);
   return cnpj ? 'https://portaldatransparencia.gov.br/pessoa-juridica/' + cnpj : '';
 };
-function CounterpartyLink(_ref7) {
+function ContractFileIcon(_ref9) {
+  let {
+    kind
+  } = _ref9;
+  const paths = {
+    diarios: ['M7 3v4M17 3v4M4 10h16', 'M5 5h14a1 1 0 0 1 1 1v14H4V6a1 1 0 0 1 1-1Z', 'M8 14h2M14 14h2M8 17h2'],
+    docs: ['M8 3h8l4 4v14H8V3Z', 'M16 3v5h4M4 7v14h11', 'M11 12h6M11 16h6'],
+    relatorio: ['M5 3h10l4 4v14H5V3Z', 'M15 3v5h4M9 17v-3M12 17v-6M15 17v-4'],
+    dados: ['M20 6c0 2-3.6 3-8 3S4 8 4 6s3.6-3 8-3 8 1 8 3Z', 'M4 6v12c0 2 3.6 3 8 3s8-1 8-3V6M4 12c0 2 3.6 3 8 3s8-1 8-3']
+  };
+  return /*#__PURE__*/React.createElement("svg", {
+    viewBox: "0 0 24 24",
+    width: "18",
+    height: "18",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: "1.7",
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": "true",
+    focusable: "false"
+  }, paths[kind].map((d, index) => /*#__PURE__*/React.createElement("path", {
+    key: index,
+    d: d
+  })));
+}
+function ContractFilesCell(_ref10) {
+  let {
+    row
+  } = _ref10;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "inline-grid w-max grid-cols-[repeat(2,28px)] gap-[4px] sm:grid-cols-[repeat(4,28px)]",
+    "aria-label": `Arquivos do contrato ${row.contrato}`
+  }, ContractFiles.fields.map(field => {
+    const href = ContractFiles.get(row, field.key);
+    const label = `${field.label} do contrato ${row.contrato}`;
+    const shared = 'inline-flex h-[28px] w-[28px] items-center justify-center rounded border';
+    return href ? /*#__PURE__*/React.createElement("a", {
+      key: field.key,
+      href: href,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      referrerPolicy: "no-referrer",
+      title: `Abrir ${label} em nova aba`,
+      "aria-label": `Abrir ${label} em nova aba`,
+      className: `${shared} border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500`
+    }, /*#__PURE__*/React.createElement(ContractFileIcon, {
+      kind: field.key
+    })) : /*#__PURE__*/React.createElement("button", {
+      key: field.key,
+      type: "button",
+      disabled: true,
+      "aria-disabled": "true",
+      title: `${label}: indisponível`,
+      "aria-label": `${label}: indisponível`,
+      className: `${shared} cursor-not-allowed border-slate-200 bg-slate-50 text-slate-300`
+    }, /*#__PURE__*/React.createElement(ContractFileIcon, {
+      kind: field.key
+    }));
+  }));
+}
+function CounterpartyLink(_ref11) {
   let {
     name,
     identifier,
     title = 'Abrir pessoa jurídica no Portal da Transparência'
-  } = _ref7;
+  } = _ref11;
   const href = counterpartyUrl(name, identifier);
   return href ? /*#__PURE__*/React.createElement("a", {
     href: href,
@@ -1437,12 +1649,12 @@ const PortalDocuments = (() => {
     short
   });
 })();
-function PortalDocumentLink(_ref8) {
+function PortalDocumentLink(_ref12) {
   let {
     value,
     context,
     children
-  } = _ref8;
+  } = _ref12;
   const href = PortalDocuments.url(value, context),
     label = children ?? value;
   return href ? /*#__PURE__*/React.createElement("a", {
@@ -1453,12 +1665,12 @@ function PortalDocumentLink(_ref8) {
     title: "Abrir documento no Portal da Transpar\xEAncia"
   }, label) : /*#__PURE__*/React.createElement("span", null, label);
 }
-function PortalDocumentTableValue(_ref9) {
+function PortalDocumentTableValue(_ref13) {
   let {
     value,
     row,
     field
-  } = _ref9;
+  } = _ref13;
   if (['documento', 'document', 'empenho'].includes(field)) return /*#__PURE__*/React.createElement(PortalDocumentLink, {
     value: value,
     context: row
@@ -1612,9 +1824,9 @@ const StatisticsPng = (() => {
             pieLinePlugin: false
           } : {})
         },
-        scales: original.scales ? Object.fromEntries(Object.entries(original.scales).map(_ref10 => {
+        scales: original.scales ? Object.fromEntries(Object.entries(original.scales).map(_ref14 => {
           var _scale$ticks, _scale$title;
-          let [key, scale] = _ref10;
+          let [key, scale] = _ref14;
           return [key, {
             ...scale,
             ticks: {
@@ -1694,8 +1906,8 @@ const StatisticsPng = (() => {
         ctx.fillStyle = datalabels.color || '#334155';
         ctx.strokeStyle = '#94a3b8';
         ctx.lineWidth = 1.5 * unit;
-        Object.entries(sides).forEach(_ref11 => {
-          let [side, items] = _ref11;
+        Object.entries(sides).forEach(_ref15 => {
+          let [side, items] = _ref15;
           return distribute(items, top, bottom, Math.min(gap, items.length > 1 ? (bottom - top) / (items.length - 1) : gap)).forEach(item => {
             const sign = side === 'left' ? -1 : 1;
             ctx.beginPath();
@@ -1719,6 +1931,8 @@ const StatisticsPng = (() => {
     distribute
   });
 })();
+
+// 4. EXPORTAÇÃO — dados escalares preservados; renderizadores e links ficam na interface.
 const ExportData = (() => {
   const numeric = value => typeof value === 'number' && Number.isFinite(value);
   const joinedLabel = value => Array.isArray(value) ? value.join(' ') : String(value == null ? '' : value);
@@ -1748,28 +1962,28 @@ const ExportData = (() => {
     const datasets = ((data === null || data === void 0 ? void 0 : data.datasets) || []).map((dataset, index) => ({
       dataset,
       index
-    })).filter(_ref12 => {
+    })).filter(_ref16 => {
       let {
         dataset,
         index
-      } = _ref12;
+      } = _ref16;
       return dataset.hidden !== true && (!(chart !== null && chart !== void 0 && chart.isDatasetVisible) || chart.isDatasetVisible(index));
     });
     const visiblePoint = index => !(type === 'pie' || type === 'doughnut') || !(chart !== null && chart !== void 0 && chart.getDataVisibility) || chart.getDataVisibility(index);
-    const objectData = datasets.some(_ref13 => {
+    const objectData = datasets.some(_ref17 => {
       let {
         dataset
-      } = _ref13;
+      } = _ref17;
       return (dataset.data || []).some(point => point && typeof point === 'object' && !Array.isArray(point));
     });
     if (objectData) {
       const rows = [],
         keys = new Set();
-      datasets.forEach(_ref14 => {
+      datasets.forEach(_ref18 => {
         let {
           dataset,
           index
-        } = _ref14;
+        } = _ref18;
         return (dataset.data || []).forEach((point, pointIndex) => {
           if (!visiblePoint(pointIndex) || !point || typeof point !== 'object') return;
           const contractPoint = Object.prototype.hasOwnProperty.call(point, 'contrato') || Object.prototype.hasOwnProperty.call(point, 'v_empenhado');
@@ -1790,10 +2004,10 @@ const ExportData = (() => {
           rows.push(row);
         });
       });
-      const monetaryY = datasets.every(_ref15 => {
+      const monetaryY = datasets.every(_ref19 => {
         let {
           dataset
-        } = _ref15;
+        } = _ref19;
         return moneySeries(dataset.label || '');
       });
       return {
@@ -1814,12 +2028,12 @@ const ExportData = (() => {
       const row = {
         subject: joinedLabel(label)
       };
-      datasets.forEach(_ref16 => {
+      datasets.forEach(_ref20 => {
         var _dataset$data;
         let {
           dataset,
           index: datasetIndex
-        } = _ref16;
+        } = _ref20;
         row[`dataset_${datasetIndex}`] = ((_dataset$data = dataset.data) === null || _dataset$data === void 0 ? void 0 : _dataset$data[index]) ?? null;
       });
       return [row];
@@ -1827,11 +2041,11 @@ const ExportData = (() => {
     const columns = [{
       header: 'ASSUNTO',
       key: 'subject'
-    }, ...datasets.map(_ref17 => {
+    }, ...datasets.map(_ref21 => {
       let {
         dataset,
         index
-      } = _ref17;
+      } = _ref21;
       const label = dataset.label || `SÉRIE ${index + 1}`,
         isPercent = label.includes('%');
       const unit = dataset.exportPercentUnit || percentUnit || (id === 'gContrato' ? 'fraction' : 'percent');
@@ -1891,8 +2105,8 @@ const ExportData = (() => {
     });
     return lines;
   };
-  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref18 => {
-    let [key, item] = _ref18;
+  const clone = value => Array.isArray(value) ? value.map(clone) : value && Object.getPrototypeOf(value) === Object.prototype ? Object.fromEntries(Object.entries(value).map(_ref22 => {
+    let [key, item] = _ref22;
     return [key, clone(item)];
   })) : value;
   const png = async (canvas, filename, title, chartConfig, visibleChart) => {
@@ -2089,9 +2303,9 @@ const exportTable = {
   toPNG: ExportData.png
 };
 const exportMasterColumns = [{
-  header: "CONTRATO",
+  header: "CONTRATO/COMPRA",
   key: "contrato"
-}, {
+}, ...ContractFiles.exportColumns(), {
   header: "SITUAÇÃO",
   key: "situacao"
 }, {
@@ -2326,11 +2540,11 @@ const startResize = e => {
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mouseup', onMouseUp);
 };
-function AutoFitText(_ref19) {
+function AutoFitText(_ref23) {
   let {
     text,
     className
-  } = _ref19;
+  } = _ref23;
   const containerRef = useRef(null);
   const textRef = useRef(null);
   useEffect(() => {
@@ -2358,7 +2572,7 @@ function AutoFitText(_ref19) {
     className: `${className} origin-left whitespace-nowrap inline-block`
   }, text));
 }
-const ChartComponent = _ref20 => {
+const ChartComponent = _ref24 => {
   let {
     type,
     data,
@@ -2369,7 +2583,7 @@ const ChartComponent = _ref20 => {
     exportColumns,
     exportPercentUnit,
     hideExportActions = false
-  } = _ref20;
+  } = _ref24;
   const coloredData = useMemo(() => MetricColors.chartData(data, type), [data, type]);
   const canvasRef = useRef(null),
     chartInstance = useRef(null);
@@ -2434,7 +2648,7 @@ const ChartComponent = _ref20 => {
 };
 
 // Componente: alterna entre Pizza, Barras e Tabela com seletor financeiro.
-function ToggleableChartCard(_ref21) {
+function ToggleableChartCard(_ref25) {
   var _title$match;
   let {
     title,
@@ -2443,7 +2657,7 @@ function ToggleableChartCard(_ref21) {
     id,
     isFornecedor,
     subjectLabel: subjectLabelProp
-  } = _ref21;
+  } = _ref25;
   const [viewMode, setViewMode] = useState('pie');
   const [finMetric, setFinMetric] = useState('total');
   const [tableSort, setTableSort] = useState({
@@ -2899,18 +3113,18 @@ function ToggleableChartCard(_ref21) {
     exportTitle: displayTitle
   }))));
 }
-function ChartTableToggle(_ref22) {
+function ChartTableToggle(_ref26) {
   let {
     isTable,
     onToggle
-  } = _ref22;
+  } = _ref26;
   return /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: onToggle,
     className: "rounded border border-blue-200 bg-blue-50 px-3 py-1.5 text-[9px] font-black uppercase tracking-widest text-blue-600 shadow-sm transition hover:bg-blue-100"
   }, isTable ? '▥ GRÁFICO' : '▦ TABELA');
 }
-function SortableChartTable(_ref23) {
+function SortableChartTable(_ref27) {
   var _columns$;
   let {
     id,
@@ -2918,7 +3132,7 @@ function SortableChartTable(_ref23) {
     rows,
     columns,
     initialSortKey
-  } = _ref23;
+  } = _ref27;
   const [sort, setSort] = useState({
     key: initialSortKey || ((_columns$ = columns[0]) === null || _columns$ === void 0 ? void 0 : _columns$.key),
     direction: 'desc'
@@ -2951,12 +3165,12 @@ function SortableChartTable(_ref23) {
       field: column.key
     });
   };
-  const exportColumns = columns.map(_ref24 => {
+  const exportColumns = columns.map(_ref28 => {
     let {
       render,
       sortValue,
       ...column
-    } = _ref24;
+    } = _ref28;
     return column;
   });
   return /*#__PURE__*/React.createElement("div", {
@@ -3000,7 +3214,7 @@ function SortableChartTable(_ref23) {
     title: columnIndex === 0 ? row._tooltip || String(row[column.key] || '') : undefined
   }, displayValue(row, column)))))))));
 }
-function KPICard(_ref25) {
+function KPICard(_ref29) {
   let {
     title,
     value,
@@ -3011,7 +3225,7 @@ function KPICard(_ref25) {
     color,
     isCurrency,
     subLabel = "do Empenhado"
-  } = _ref25;
+  } = _ref29;
   const colors = {
     slate: "border-slate-800 text-slate-800",
     blue: "border-blue-500 text-blue-700",
@@ -3034,7 +3248,7 @@ function KPICard(_ref25) {
     }, line)));
   };
   return /*#__PURE__*/React.createElement("div", {
-    className: `bg-white p-3 sm:p-5 rounded-2xl border-t-8 shadow-md flex flex-col justify-center overflow-hidden min-w-0 ${colors[color]}`,
+    className: `bg-white p-3 sm:p-5 rounded-2xl border-t-8 shadow-md flex flex-col justify-start overflow-hidden min-w-0 ${colors[color]}`,
     "data-metric": isCurrency ? MetricColors.key(title) : undefined,
     style: isCurrency ? MetricColors.cardStyle(title) : undefined
   }, /*#__PURE__*/React.createElement("h3", {
@@ -3052,7 +3266,7 @@ function KPICard(_ref25) {
     className: "text-[10px] font-bold opacity-70 mt-1"
   }, formatPercentBR(subValue), " ", subLabel), renderExtraText()));
 }
-function TextHeader(_ref26) {
+function TextHeader(_ref30) {
   let {
     label,
     field,
@@ -3062,7 +3276,7 @@ function TextHeader(_ref26) {
     searchVal,
     onSearchChange,
     widthClass
-  } = _ref26;
+  } = _ref30;
   const isSorted = current.key === field;
   return /*#__PURE__*/React.createElement("th", {
     className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -3083,7 +3297,7 @@ function TextHeader(_ref26) {
     className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   }));
 }
-function NumericHeader(_ref27) {
+function NumericHeader(_ref31) {
   let {
     label,
     field,
@@ -3093,7 +3307,7 @@ function NumericHeader(_ref27) {
     setNumFilters,
     align = "left",
     widthClass
-  } = _ref27;
+  } = _ref31;
   const isSorted = current.key === field;
   const filterMin = numFilters[field] ? numFilters[field].min : '';
   const filterMax = numFilters[field] ? numFilters[field].max : '';
@@ -3152,7 +3366,7 @@ function NumericHeader(_ref27) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function DateFilterHeader(_ref28) {
+function DateFilterHeader(_ref32) {
   let {
     label,
     field,
@@ -3162,7 +3376,7 @@ function DateFilterHeader(_ref28) {
     setDateFilters,
     align = "left",
     widthClass
-  } = _ref28;
+  } = _ref32;
   const isSorted = current.key === field;
   const filterMin = dateFilters[field] ? dateFilters[field].min : '';
   const filterMax = dateFilters[field] ? dateFilters[field].max : '';
@@ -3213,13 +3427,13 @@ function DateFilterHeader(_ref28) {
     className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
   })));
 }
-function MultiSelect(_ref29) {
+function MultiSelect(_ref33) {
   let {
     label,
     options,
     selected,
     onChange
-  } = _ref29;
+  } = _ref33;
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef();
@@ -3285,12 +3499,12 @@ function MultiSelect(_ref29) {
     title: o
   }, o))))));
 }
-function DateInput(_ref30) {
+function DateInput(_ref34) {
   let {
     label,
     value,
     onChange
-  } = _ref30;
+  } = _ref34;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
   }, label), /*#__PURE__*/React.createElement("input", {
@@ -3355,14 +3569,14 @@ function AccessMetadata() {
     className: "italic"
   }, "Produzido por Cel Brito"));
 }
-function CollapsibleSection(_ref31) {
+function CollapsibleSection(_ref35) {
   let {
     title,
     children,
     defaultOpen = false,
     globalTrigger,
     globalState
-  } = _ref31;
+  } = _ref35;
   const [isOpen, setIsOpen] = useState(defaultOpen);
   useEffect(() => {
     if (globalTrigger > 0) setIsOpen(globalState);
@@ -3382,6 +3596,8 @@ function CollapsibleSection(_ref31) {
     className: "mt-6"
   }, children));
 }
+
+// 5. DOCUMENTOS — carga, relacionamento contábil e filtros locais compartilhados com o painel.
 const DocumentModule = ((sharedExports, sharedChart) => {
   const tagColorsMap = {
     'VIG SEM EXEC': {
@@ -3493,20 +3709,20 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     document.addEventListener('mouseup', onMouseUp);
   };
   const exportTable = sharedExports;
-  const FormatNegativeValue = _ref32 => {
+  const FormatNegativeValue = _ref36 => {
     let {
       val
-    } = _ref32;
+    } = _ref36;
     if (val === null || val === undefined) return /*#__PURE__*/React.createElement("span", null, "-");
     const isNegative = val < -0.001;
     return /*#__PURE__*/React.createElement("span", {
       className: isNegative ? "underline decoration-red-500 decoration-[2px] underline-offset-2" : ""
     }, formatBRL(val));
   };
-  const ContratoCell = _ref33 => {
+  const ContratoCell = _ref37 => {
     let {
       row
-    } = _ref33;
+    } = _ref37;
     return /*#__PURE__*/React.createElement("div", {
       className: "flex flex-col"
     }, /*#__PURE__*/React.createElement("span", {
@@ -3517,14 +3733,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "text-[8px] text-slate-500 leading-tight whitespace-normal break-words"
     }, "Mod: ", row.modalidade));
   };
-  function CollapsibleSection(_ref34) {
+  function CollapsibleSection(_ref38) {
     let {
       title,
       children,
       defaultOpen = false,
       globalTrigger,
       globalState
-    } = _ref34;
+    } = _ref38;
     const [isOpen, setIsOpen] = useState(defaultOpen);
     useEffect(() => {
       if (globalTrigger > 0) setIsOpen(globalState);
@@ -3544,11 +3760,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-6"
     }, children));
   }
-  function AutoFitText(_ref35) {
+  function AutoFitText(_ref39) {
     let {
       text,
       className
-    } = _ref35;
+    } = _ref39;
     const containerRef = useRef(null);
     const textRef = useRef(null);
     useEffect(() => {
@@ -3576,12 +3792,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     }, text));
   }
   const ChartComponent = sharedChart;
-  function DocumentComposition(_ref36) {
+  function DocumentComposition(_ref40) {
     let {
       counts,
       amounts,
       uniqueDocs
-    } = _ref36;
+    } = _ref40;
     const canvasRef = useRef(null);
     const rows = useMemo(() => {
       const stages = [{
@@ -3778,7 +3994,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       role: "img"
     })));
   }
-  function LatestDocCard(_ref37) {
+  function LatestDocCard(_ref41) {
     var _MetricColors$get2;
     let {
       title,
@@ -3786,7 +4002,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       metricField,
       colorClass,
       showEmitente
-    } = _ref37;
+    } = _ref41;
     const first = docs === null || docs === void 0 ? void 0 : docs[0];
     const totalValue = useMemo(() => (docs || []).reduce((sum, doc) => sum + (doc[metricField] || 0), 0), [docs, metricField]);
     const daysText = useMemo(() => {
@@ -3844,7 +4060,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "break-words text-[9px] font-bold text-slate-500"
     }, doc.ug))))));
   }
-  function TextHeader(_ref38) {
+  function TextHeader(_ref42) {
     let {
       label,
       field,
@@ -3854,7 +4070,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       searchVal,
       onSearchChange,
       widthClass
-    } = _ref38;
+    } = _ref42;
     const isSorted = current.key === field;
     return /*#__PURE__*/React.createElement("th", {
       className: `p-2 transition text-${align} bg-slate-50 relative group ${widthClass || 'w-auto'}`
@@ -3875,7 +4091,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "mt-2 w-full px-1 py-1 text-slate-800 text-[9px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     }));
   }
-  function NumericHeader(_ref39) {
+  function NumericHeader(_ref43) {
     let {
       label,
       field,
@@ -3885,7 +4101,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setNumFilters,
       align = "left",
       widthClass
-    } = _ref39;
+    } = _ref43;
     const isSorted = current.key === field;
     const handleMin = e => setNumFilters(p => ({
       ...p,
@@ -3930,7 +4146,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function DateFilterHeader(_ref40) {
+  function DateFilterHeader(_ref44) {
     let {
       label,
       field,
@@ -3940,7 +4156,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       setDateFilters,
       align = "left",
       widthClass
-    } = _ref40;
+    } = _ref44;
     const isSorted = current.key === field;
     const handleMin = e => setDateFilters(p => ({
       ...p,
@@ -3983,13 +4199,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full px-1 py-1 text-slate-800 text-[8px] font-normal rounded border border-slate-300 outline-none focus:border-blue-500 shadow-inner"
     })));
   }
-  function MultiSelect(_ref41) {
+  function MultiSelect(_ref45) {
     let {
       label,
       options,
       selected,
       onChange
-    } = _ref41;
+    } = _ref45;
     const [isOpen, setIsOpen] = useState(false);
     const [search, setSearch] = useState("");
     const ref = useRef();
@@ -4053,12 +4269,12 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "truncate leading-tight"
     }, o))))));
   }
-  function DateInput(_ref42) {
+  function DateInput(_ref46) {
     let {
       label,
       value,
       onChange
-    } = _ref42;
+    } = _ref46;
     return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
       className: "text-[9px] font-black text-slate-400 block mb-1 uppercase tracking-widest"
     }, label), /*#__PURE__*/React.createElement("input", {
@@ -4068,7 +4284,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs font-bold text-slate-700 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-sm cursor-pointer"
     }));
   }
-  function KPICard(_ref43) {
+  function KPICard(_ref47) {
     let {
       title,
       value,
@@ -4078,7 +4294,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       color,
       isCurrency,
       extraText
-    } = _ref43;
+    } = _ref47;
     const colors = {
       slate: "border-slate-800 text-slate-800",
       blue: "border-blue-500 text-blue-700",
@@ -4091,7 +4307,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     const mainText = isCurrency ? formatBRL(value) : value.toLocaleString('pt-BR');
     const subText = subValue !== undefined ? `${formatPercentBR(subValue)}${percSuffix || ''}` : '';
     return /*#__PURE__*/React.createElement("div", {
-      className: `bg-white p-3 sm:p-5 rounded-2xl border-t-8 shadow-md flex flex-col justify-center overflow-hidden min-w-0 ${colors[color]}`,
+      className: `bg-white p-3 sm:p-5 rounded-2xl border-t-8 shadow-md flex flex-col justify-start overflow-hidden min-w-0 ${colors[color]}`,
       "data-metric": isCurrency ? MetricColors.key(title) : undefined,
       style: isCurrency ? MetricColors.cardStyle(title) : undefined
     }, /*#__PURE__*/React.createElement("h3", {
@@ -4112,13 +4328,13 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       key: idx
     }, line)))));
   }
-  function DocStatCard(_ref44) {
+  function DocStatCard(_ref48) {
     let {
       title,
       count,
       date,
       timestamp
-    } = _ref44;
+    } = _ref48;
     const daysText = useMemo(() => {
       if (!timestamp) return '';
       const today = new Date();
@@ -4129,7 +4345,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       return ` (${diffDays} dia${diffDays === 1 ? '' : 's'} até hoje)`;
     }, [timestamp]);
     return /*#__PURE__*/React.createElement("div", {
-      className: "bg-white p-3 sm:p-4 rounded-2xl border-t-4 border-slate-400 shadow-md flex flex-col justify-center overflow-hidden min-w-0"
+      className: "bg-white p-3 sm:p-4 rounded-2xl border-t-4 border-slate-400 shadow-md flex flex-col justify-start overflow-hidden min-w-0"
     }, /*#__PURE__*/React.createElement("h3", {
       className: "text-[9px] font-black uppercase tracking-widest opacity-60 mb-1 truncate",
       title: title
@@ -4143,7 +4359,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // COMPONENTE: SUBTABELA DETALHADA
   // =========================================================
-  function SubTable(_ref45) {
+  function SubTable(_ref49) {
     let {
       title,
       data,
@@ -4153,7 +4369,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       rowBgColor,
       textColor,
       showDiasAss = false
-    } = _ref45;
+    } = _ref49;
     const [limit, setLimit] = useState(100);
     const [sortConfig, setSortConfig] = useState({
       key: 'diaVal',
@@ -4165,6 +4381,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     const [visibleCols, setVisibleCols] = useState({
       dia: true,
       contrato: true,
+      arquivos: true,
       sec_log: true,
       existencia: true,
       situacao: true,
@@ -4304,10 +4521,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         key: "dia"
       });
       if (visibleCols.contrato) cols.push({
-        header: "CONTRATO",
+        header: "CONTRATO/COMPRA",
         key: "contrato",
         format: r => `${r.contrato}\nCompra: ${r.compra}\nMod: ${r.modalidade}`
       });
+      if (visibleCols.arquivos) cols.push(...ContractFiles.exportColumns());
       if (visibleCols.sec_log) cols.push({
         header: "SEC LOG",
         key: "sec_log"
@@ -4449,7 +4667,10 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       onSort: handleSort,
       searchVal: searchContrato,
       onSearchChange: setSearchContrato
-    }), visibleCols.sec_log && /*#__PURE__*/React.createElement(TextHeader, {
+    }), visibleCols.arquivos && /*#__PURE__*/React.createElement("th", {
+      scope: "col",
+      className: "w-[76px] min-w-[76px] p-2 align-top text-center sm:w-[140px] sm:min-w-[140px]"
+    }, "ARQUIVOS"), visibleCols.sec_log && /*#__PURE__*/React.createElement(TextHeader, {
       widthClass: "w-[5%]",
       label: "SEC LOG",
       field: "sec_log",
@@ -4585,6 +4806,10 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "p-2 align-top min-w-[150px]"
     }, /*#__PURE__*/React.createElement(ContratoCell, {
       row: row
+    })), visibleCols.arquivos && /*#__PURE__*/React.createElement("td", {
+      className: "p-2 align-top"
+    }, /*#__PURE__*/React.createElement(ContractFilesCell, {
+      row: row
     })), visibleCols.sec_log && /*#__PURE__*/React.createElement("td", {
       className: "p-2 text-slate-500 font-bold whitespace-normal break-words"
     }, row.sec_log), visibleCols.situacao && /*#__PURE__*/React.createElement("td", {
@@ -4676,8 +4901,14 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       className: "bg-slate-200 sticky bottom-0 border-t-2 border-slate-300 shadow-md z-10"
     }, /*#__PURE__*/React.createElement("tr", {
       className: "text-slate-700 uppercase font-black"
-    }, /*#__PURE__*/React.createElement("td", {
-      colSpan: Object.values(visibleCols).filter(v => v).length - 1,
+    }, Object.entries(visibleCols).some(_ref50 => {
+      let [key, shown] = _ref50;
+      return shown && key !== 'metricas';
+    }) && /*#__PURE__*/React.createElement("td", {
+      colSpan: Object.entries(visibleCols).filter(_ref51 => {
+        let [key, shown] = _ref51;
+        return shown && key !== 'metricas';
+      }).length,
       className: "p-2 text-right"
     }, "TOTAL DA M\xC9TRICA:"), visibleCols.metricas && /*#__PURE__*/React.createElement("td", {
       className: `p-2 text-right ${textColor}`,
@@ -4696,7 +4927,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
   // =========================================================
   // DASHBOARD MASTER CONTÁBIL
   // =========================================================
-  function useDashboard(_ref46) {
+  function useDashboard(_ref52) {
     let {
       payload,
       shared,
@@ -4705,7 +4936,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       globalExpandState,
       expandTrigger,
       resetRevision
-    } = _ref46;
+    } = _ref52;
     const [rawData, setRawData] = useState([]);
     const [processedPayload, setProcessedPayload] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -4772,6 +5003,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     const [masterCols, setMasterCols] = useState({
       dia: true,
       contrato: true,
+      arquivos: true,
       sec_log: true,
       situacao: true,
       movimento: true,
@@ -5086,6 +5318,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         nd_nome_values: []
       });
       const ledgerByContract = (payload === null || payload === void 0 ? void 0 : payload.ledgerIndex) || ContractRules.accountingBalances(contabilRows);
+      const filesByContract = ContractFiles.index(geralRows);
       const canonicalContracts = new Map();
       rawContracts.forEach(row => {
         const id = UnifiedData.key(row.contrato);
@@ -5162,6 +5395,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           const sitText = classification.labels.join(' ');
           geralDict[UnifiedData.key(contrato)] = {
             contrato,
+            files: filesByContract.get(UnifiedData.key(contrato)) || ContractFiles.empty,
             fornecedor: getVG(["Fornecedor"], [], row).toUpperCase() || "N/I",
             fiscal: getVG(["FISCAL_TITULAR", "Fiscal Titular"], ["fiscal"], row).toUpperCase() || "N/I",
             gestor: getVG(["GESTOR_TITULAR", "Gestor Titular"], ["gestor"], row).toUpperCase() || "N/I",
@@ -5242,7 +5476,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           }
         }
         const valor = parseValue(valStr);
-        const diaVal = parseDateBR(dia) ? parseDateBR(dia).getTime() : 0;
+        const diaParsed = parseDateBR(dia);
+        const diaVal = diaParsed ? diaParsed.getTime() : 0;
         const key = `${dia}|${ug}|${gestao}|${fav}|${favCnpj}|${empenho}|${doc}|${contrato}`;
         if (doc.includes("RO") && diaVal > 0 && contrato !== "-") {
           const keyRE = `${UnifiedData.key(contrato)}|${UnifiedData.key(empenho)}`;
@@ -5276,6 +5511,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             modalidade: metadadosContrato ? metadadosContrato.modalidade : 'N/I',
             compra: metadadosContrato ? metadadosContrato.compra : 'N/I',
             v_global: metadadosContrato ? metadadosContrato.v_global : 0,
+            files: (metadadosContrato === null || metadadosContrato === void 0 ? void 0 : metadadosContrato.files) || ContractFiles.empty,
             contract_metadata: metadadosContrato === null || metadadosContrato === void 0 ? void 0 : metadadosContrato.contract_metadata,
             situacaoFlags: metadadosContrato ? metadadosContrato.situacaoFlags : [],
             situacao: metadadosContrato ? metadadosContrato.situacao : 'N/I',
@@ -5347,6 +5583,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
             modalidade: meta.modalidade,
             compra: meta.compra,
             objeto: meta.objeto,
+            files: meta.files || ContractFiles.empty,
             contract_metadata: meta.contract_metadata,
             situacaoFlags: meta.situacaoFlags,
             situacao: meta.situacao,
@@ -6484,10 +6721,11 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         key: "dia"
       });
       if (masterCols.contrato) cols.push({
-        header: "CONTRATO",
+        header: "CONTRATO/COMPRA",
         key: "contrato",
         format: r => `${r.contrato}\nCompra: ${r.compra}\nMod: ${r.modalidade}`
       });
+      if (masterCols.arquivos) cols.push(...ContractFiles.exportColumns());
       if (masterCols.sec_log) cols.push({
         header: "SEC LOG",
         key: "sec_log"
@@ -6696,17 +6934,18 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     let masterColSpanCount = 0;
     if (masterCols.dia) masterColSpanCount++;
     if (masterCols.contrato) masterColSpanCount++;
+    if (masterCols.arquivos) masterColSpanCount++;
     if (masterCols.sec_log) masterColSpanCount++;
     if (masterCols.existencia) masterColSpanCount++;
     if (masterCols.situacao) masterColSpanCount++;
     if (masterCols.movimento) masterColSpanCount++;
     if (masterCols.diasAss) masterColSpanCount++;
-    if (masterCols.vigencia) masterColSpanCount += 2;
+    if (masterCols.vigencia) masterColSpanCount++;
     if (masterCols.perc_tempo) masterColSpanCount++;
     if (masterCols.emitente) masterColSpanCount++;
     if (masterCols.favorecido) masterColSpanCount++;
     if (masterCols.objeto) masterColSpanCount++;
-    if (masterCols.gestor) masterColSpanCount += 2;
+    if (masterCols.gestor) masterColSpanCount++;
     if (masterCols.empenho) masterColSpanCount++;
     if (masterCols.documento) masterColSpanCount++;
     if (masterCols.obs) masterColSpanCount++;
@@ -7232,7 +7471,10 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         onSort: handleSort,
         searchVal: searchContratoTabela,
         onSearchChange: setSearchContratoTabela
-      }), masterCols.sec_log && /*#__PURE__*/React.createElement(TextHeader, {
+      }), masterCols.arquivos && /*#__PURE__*/React.createElement("th", {
+        scope: "col",
+        className: "w-[76px] min-w-[76px] p-2 align-top text-center sm:w-[140px] sm:min-w-[140px]"
+      }, "ARQUIVOS"), masterCols.sec_log && /*#__PURE__*/React.createElement(TextHeader, {
         widthClass: "w-[5%]",
         label: "SEC LOG",
         field: "sec_log",
@@ -7415,6 +7657,10 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         className: "p-2 align-top min-w-[150px]"
       }, /*#__PURE__*/React.createElement(ContratoCell, {
         row: row
+      })), masterCols.arquivos && /*#__PURE__*/React.createElement("td", {
+        className: "p-2 align-top"
+      }, /*#__PURE__*/React.createElement(ContractFilesCell, {
+        row: row
       })), masterCols.sec_log && /*#__PURE__*/React.createElement("td", {
         className: "p-2 text-slate-500 font-bold whitespace-normal break-words"
       }, row.sec_log), masterCols.existencia && /*#__PURE__*/React.createElement("td", {
@@ -7534,7 +7780,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         className: "bg-slate-200 sticky bottom-0 border-t-2 border-slate-300 shadow-md z-10"
       }, /*#__PURE__*/React.createElement("tr", {
         className: "text-slate-700 uppercase font-black"
-      }, /*#__PURE__*/React.createElement("td", {
+      }, masterColSpanCount > 0 && /*#__PURE__*/React.createElement("td", {
         colSpan: masterColSpanCount,
         className: "p-2 text-right"
       }, "TOTAIS:"), masterCols.v_emp && /*#__PURE__*/React.createElement("td", {
@@ -7968,6 +8214,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     useDashboard
   };
 })(exportTable, ChartComponent);
+
+// 6. NAVEGAÇÃO E PAINEL — estados de filtro, índices da carga e agregações memorizadas.
 const DashboardPages = Object.freeze([{
   id: 1,
   label: 'PÁGINA 1',
@@ -7989,11 +8237,11 @@ const DashboardPages = Object.freeze([{
   label: 'PÁGINA 5',
   detail: 'Tabelas dos documentos'
 }]);
-function PageNavigation(_ref47) {
+function PageNavigation(_ref53) {
   let {
     activePage,
     onPageChange
-  } = _ref47;
+  } = _ref53;
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef(null),
     panelRef = useRef(null);
@@ -8049,15 +8297,12 @@ function PageNavigation(_ref47) {
     "aria-haspopup": "dialog",
     "aria-label": `Abrir menu de páginas. Página atual: ${current.label}, ${current.detail}`,
     title: "Abrir menu de p\xE1ginas",
-    className: "fixed left-0 top-1/2 z-40 -translate-y-1/2 rounded-r-xl border border-l-0 border-blue-700 bg-blue-700 px-2.5 py-4 text-white shadow-lg transition hover:bg-blue-800 focus-visible:outline focus-visible:outline-4 focus-visible:outline-offset-2 focus-visible:outline-blue-500",
-    style: {
-      writingMode: 'vertical-rl'
-    }
+    className: "fixed right-3 top-3 z-40 inline-flex max-w-[calc(100vw-1.5rem)] items-center gap-2 rounded-xl border border-blue-700 bg-blue-700 px-4 py-3 text-white shadow-lg transition hover:bg-blue-800 focus-visible:outline focus-visible:outline-4 focus-visible:outline-offset-2 focus-visible:outline-blue-500 sm:right-4 sm:top-4"
   }, /*#__PURE__*/React.createElement("span", {
     "aria-hidden": "true",
-    className: "mb-2 text-lg"
+    className: "text-lg leading-none"
   }, "\u2630"), /*#__PURE__*/React.createElement("span", {
-    className: "text-[11px] font-black tracking-widest"
+    className: "text-xs font-black tracking-wider"
   }, "P\xC1GINAS")), /*#__PURE__*/React.createElement("div", {
     hidden: !isOpen,
     className: "fixed inset-0 z-[80] bg-slate-950/50",
@@ -8117,18 +8362,19 @@ function Dashboard() {
   const [rawData, setRawData] = useState([]);
   const [apiPayload, setApiPayload] = useState(null);
   const [linkDiagnostics, setLinkDiagnostics] = useState(null);
+  const missingFileColumns = useMemo(() => ContractFiles.missingColumns(apiPayload === null || apiPayload === void 0 ? void 0 : apiPayload.geral), [apiPayload]);
   const [resetRevision, setResetRevision] = useState(0);
   const loadingRef = useRef(false);
-  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV5') === '1');
+  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV6') === '1');
   const closeSummary = React.useCallback(() => {
-    sessionStorage.removeItem('summary_pending_TotalV5');
+    sessionStorage.removeItem('summary_pending_TotalV6');
     setSummaryRequested(false);
   }, []);
   const [activePage, setActivePage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("A verificar sessão local...");
-  const currentUser = sessionStorage.getItem('user_TotalV5') || 'Usuário';
-  const currentPerfil = sessionStorage.getItem('perfil_TotalV5') || '';
+  const currentUser = sessionStorage.getItem('user_TotalV6') || 'Usuário';
+  const currentPerfil = sessionStorage.getItem('perfil_TotalV6') || '';
 
   // Estado de Expansão Global das seções
   const [globalExpandState, setGlobalExpandState] = useState(false);
@@ -8210,7 +8456,8 @@ function Dashboard() {
   const [expandedBudgetDimensions, setExpandedBudgetDimensions] = useState({});
   const financeTableRef = useRef(null);
   const masterColumnLabels = {
-    contrato: "CONTRATO",
+    contrato: "CONTRATO/COMPRA",
+    arquivos: "ARQUIVOS",
     situacao: "SITUAÇÃO",
     secLog: "SEC LOG",
     fornecedor: "FORNECEDOR",
@@ -8248,6 +8495,7 @@ function Dashboard() {
   };
   const [masterVisibleCols, setMasterVisibleCols] = useState({
     contrato: true,
+    arquivos: true,
     situacao: true,
     secLog: true,
     fornecedor: true,
@@ -8551,7 +8799,7 @@ function Dashboard() {
     clearAuthStorage();
     try {
       localStorage.removeItem(DASH_CACHE_KEY);
-      localStorage.removeItem('dashData_TotalV5');
+      localStorage.removeItem('dashData_TotalV6');
     } catch (e) {}
     window.location.reload();
   };
@@ -8817,20 +9065,21 @@ function Dashboard() {
     });
     setStatus("A estruturar matriz de dados...");
     const headers = rowsArray[0];
+    const filesByContract = ContractFiles.index(rowsArray);
     const normalizedHeaders = headers.map(normalizeStr);
     const headerIndices = new Map(normalizedHeaders.map((value, index) => [value, index]));
-    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref48 => {
-      let [contract, totals] = _ref48;
+    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref54 => {
+      let [contract, totals] = _ref54;
       return [contract, totals.v_recebido];
     }));
     const receivedAssigned = new Set();
     const recebidoByDocumento = buildRecebidoByDocumento(contabilRows);
     const orcamentarioByContrato = buildOrcamentarioByContrato(orcamentarioRows, recebidoByDocumento);
+    const findBudgetContract = UnifiedData.contractLookup(orcamentarioByContrato);
     const hoje = new Date();
     hoje.setHours(0, 0, 0, 0);
     const uniqueRows = new Map(rowsArray.slice(1).map(row => [JSON.stringify(row), row]));
     const mappedRaw = [...uniqueRows.values()].map(row => {
-      var _Object$entries$find;
       const getVal = function (exactNames) {
         let fallbackKeywords = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
         let nameArr = Array.isArray(exactNames) ? exactNames : [exactNames];
@@ -8867,10 +9116,7 @@ function Dashboard() {
       const receivedKey = normalizeContractKey(contrato);
       const v_recebido = receivedAssigned.has(receivedKey) ? 0 : recebidoByContrato[receivedKey] || 0;
       receivedAssigned.add(receivedKey);
-      const orcamentario = orcamentarioByContrato[contrato] || ((_Object$entries$find = Object.entries(orcamentarioByContrato).find(_ref49 => {
-        let [key] = _ref49;
-        return normalizeContractKey(key) === normalizeContractKey(contrato);
-      })) === null || _Object$entries$find === void 0 ? void 0 : _Object$entries$find[1]) || emptyOrcamentario();
+      const orcamentario = findBudgetContract(contrato) || emptyOrcamentario();
       const v_a_liquidar = v_empenhado - v_liquidado - v_cancelado - v_bloqueado;
       const v_a_pagar = v_empenhado - v_pago - v_cancelado - v_bloqueado;
       const p_a_liquidar = v_empenhado ? v_a_liquidar / v_empenhado : 0;
@@ -8878,6 +9124,7 @@ function Dashboard() {
       const p_recebido = v_empenhado ? v_recebido / v_empenhado : 0;
       return {
         contrato,
+        files: filesByContract.get(UnifiedData.key(contrato)) || ContractFiles.empty,
         ...orcamentario,
         ao_codigos: orcamentario.ao_codigo_values.join('; ') || '-',
         po_codigos: orcamentario.po_codigo_values.join('; ') || '-',
@@ -8921,9 +9168,9 @@ function Dashboard() {
       };
     }).filter(r => r.contrato !== "-");
     const canonicalIndex = ContractRules.contractIndex(mappedRaw);
-    const canonicalClassifications = new Map([...canonicalIndex].map(_ref50 => {
+    const canonicalClassifications = new Map([...canonicalIndex].map(_ref55 => {
       var _ledgerIndex$get;
-      let [id, entry] = _ref50;
+      let [id, entry] = _ref55;
       return [id, ContractRules.classify(entry.totals, entry.metadata, (_ledgerIndex$get = ledgerIndex.get(id)) === null || _ledgerIndex$get === void 0 ? void 0 : _ledgerIndex$get.hasMovement, hoje)];
     }));
 
@@ -8970,7 +9217,7 @@ function Dashboard() {
     }
     try {
       setStatus("A transferir dados via Api...");
-      const token = sessionStorage.getItem('token_TotalV5');
+      const token = sessionStorage.getItem('token_TotalV6');
       if (!token) throw new Error("Token de acesso não encontrado. Faça login novamente.");
       const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}`);
       const json = await readAppsScriptJson(response, 'a sincronização dos dados');
@@ -9046,8 +9293,8 @@ function Dashboard() {
       nd_subelemento_filter_values: 'nd_subelemento_filter_values'
     };
     documentDashboard.budgetIndex.byContract.forEach(details => details.forEach(detail => {
-      Object.entries(budgetOptionsMap).forEach(_ref51 => {
-        let [field, property] = _ref51;
+      Object.entries(budgetOptionsMap).forEach(_ref56 => {
+        let [field, property] = _ref56;
         const values = Array.isArray(detail[property]) ? detail[property] : splitBudgetDimensionValue(detail[property]);
         values.forEach(value => {
           if (value && value !== '-' && value !== 'N/I') accumulators[field].add(value);
@@ -9063,6 +9310,17 @@ function Dashboard() {
     return options;
   }, [rawData, documentDashboard.options, documentDashboard.budgetIndex]);
   const filteredData = useMemo(() => {
+    const filterDateBounds = {
+      startFrom: dInicDe ? new Date(dInicDe + 'T00:00:00').getTime() : null,
+      startUntil: dInicAte ? new Date(dInicAte + 'T23:59:59').getTime() : null,
+      endFrom: dFimDe ? new Date(dFimDe + 'T00:00:00').getTime() : null,
+      endUntil: dFimAte ? new Date(dFimAte + 'T23:59:59').getTime() : null,
+      columnStartFrom: dateFilters.data_inic.min ? new Date(dateFilters.data_inic.min + 'T00:00:00').getTime() : null,
+      columnStartUntil: dateFilters.data_inic.max ? new Date(dateFilters.data_inic.max + 'T23:59:59').getTime() : null,
+      columnEndFrom: dateFilters.data_fim.min ? new Date(dateFilters.data_fim.min + 'T00:00:00').getTime() : null,
+      columnEndUntil: dateFilters.data_fim.max ? new Date(dateFilters.data_fim.max + 'T23:59:59').getTime() : null
+    };
+    const budgetFilterActive = UnifiedData.hasBudgetFilters(sharedFilters);
     let filtered = rawData.filter(item => {
       const mFisc = fFiscal.length === 0 || fFiscal.includes(item.fiscal);
       const mGest = fGestor.length === 0 || fGestor.includes(item.gestor);
@@ -9079,15 +9337,15 @@ function Dashboard() {
       const mPtres = matchesOrcamentario(fPtres, 'ptres_values');
       const mPi = matchesOrcamentario(fPi, 'pi_filter_values');
       const mNd = matchesOrcamentario(fNd, 'nd_filter_values');
-      const mDDe = !dInicDe || item.dtInicVal && item.dtInicVal >= new Date(dInicDe + "T00:00:00").getTime();
-      const mDAte = !dInicAte || item.dtInicVal && item.dtInicVal <= new Date(dInicAte + "T23:59:59").getTime();
-      const mFDe = !dFimDe || item.dtFimVal && item.dtFimVal >= new Date(dFimDe + "T00:00:00").getTime();
-      const mFAte = !dFimAte || item.dtFimVal && item.dtFimVal <= new Date(dFimAte + "T23:59:59").getTime();
+      const mDDe = !dInicDe || item.dtInicVal && item.dtInicVal >= filterDateBounds.startFrom;
+      const mDAte = !dInicAte || item.dtInicVal && item.dtInicVal <= filterDateBounds.startUntil;
+      const mFDe = !dFimDe || item.dtFimVal && item.dtFimVal >= filterDateBounds.endFrom;
+      const mFAte = !dFimAte || item.dtFimVal && item.dtFimVal <= filterDateBounds.endUntil;
       let mDateTbl = true;
-      if (dateFilters.data_inic.min && item.dtInicVal < new Date(dateFilters.data_inic.min + "T00:00:00").getTime()) mDateTbl = false;
-      if (dateFilters.data_inic.max && item.dtInicVal > new Date(dateFilters.data_inic.max + "T23:59:59").getTime()) mDateTbl = false;
-      if (dateFilters.data_fim.min && item.dtFimVal < new Date(dateFilters.data_fim.min + "T00:00:00").getTime()) mDateTbl = false;
-      if (dateFilters.data_fim.max && item.dtFimVal > new Date(dateFilters.data_fim.max + "T23:59:59").getTime()) mDateTbl = false;
+      if (dateFilters.data_inic.min && item.dtInicVal < filterDateBounds.columnStartFrom) mDateTbl = false;
+      if (dateFilters.data_inic.max && item.dtInicVal > filterDateBounds.columnStartUntil) mDateTbl = false;
+      if (dateFilters.data_fim.min && item.dtFimVal < filterDateBounds.columnEndFrom) mDateTbl = false;
+      if (dateFilters.data_fim.max && item.dtFimVal > filterDateBounds.columnEndUntil) mDateTbl = false;
       const sCont = !searchContrato || item.contrato.includes(searchContrato.toUpperCase()) || item.compra.includes(searchContrato.toUpperCase()) || item.modalidade.includes(searchContrato.toUpperCase());
       const sSit = !searchSituacao || item.situacao.includes(searchSituacao.toUpperCase());
       const sSecLog = !searchSecLog || item.sec_log.includes(searchSecLog.toUpperCase());
@@ -9110,7 +9368,7 @@ function Dashboard() {
         }
       }
       const mDocuments = !documentDashboard.contractKeys || documentDashboard.contractKeys.has(normalizeContractKey(item.contrato));
-      const mBudget = !UnifiedData.hasBudgetFilters(sharedFilters) || (item.orc_detail_rows || []).some(detail => UnifiedData.matchesBudgetDetail(detail, sharedFilters));
+      const mBudget = !budgetFilterActive || (item.orc_detail_rows || []).some(detail => UnifiedData.matchesBudgetDetail(detail, sharedFilters));
       return mDocuments && mBudget && mFisc && mGest && mFiscSub && mGestSub && mSec && mCont && mForn && mCompra && mMod && mAo && mPo && mPtres && mPi && mNd && mDDe && mDAte && mFDe && mFAte && mDateTbl && sCont && sSit && sSecLog && sForn && sObj && sGest && sAo && sPo && sNd && mSitTag && mNum;
     });
     if (sortConfig.key) {
@@ -9739,9 +9997,12 @@ function Dashboard() {
   const top20100DataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort), [filteredData, filteredOrcamentarioDetails, commitmentData, top20100Sort, top20100ViewMode]);
   const top20AllDataProcessed = useMemo(() => buildTop20Data(top20ViewMode, top20Sort, null), [filteredData, filteredOrcamentarioDetails, commitmentData, top20Sort, top20ViewMode]);
   const top20100AllDataProcessed = useMemo(() => buildTop20Data(top20100ViewMode, top20100Sort, null), [filteredData, filteredOrcamentarioDetails, commitmentData, top20100Sort, top20100ViewMode]);
+
+  // Performance and correlation share one immutable aggregate per filtered set.
+  const canonicalChartRows = useMemo(() => ContractRules.aggregateContracts(filteredData), [filteredData]);
   const contratoAllData = useMemo(() => {
     const remaining = row => row.encerrando_dias === null || !Number.isFinite(row.encerrando_dias) ? null : row.encerrando_dias;
-    const arr = ContractRules.aggregateContracts(filteredData).map(row => ({
+    const arr = canonicalChartRows.map(row => ({
       ...row,
       p_recebido: row.v_empenhado ? (row.v_recebido || 0) / row.v_empenhado : 0,
       p_liquidado: row.v_empenhado ? (row.v_liquidado || 0) / row.v_empenhado : 0,
@@ -9763,7 +10024,7 @@ function Dashboard() {
       });
     });
     return arr;
-  }, [filteredData, contratoSort]);
+  }, [canonicalChartRows, contratoSort]);
   const contratoChartData = useMemo(() => contratoAllData.slice(0, 20), [contratoAllData]);
   const dataByAno = useMemo(() => {
     let minYear = 9999;
@@ -9803,7 +10064,7 @@ function Dashboard() {
     });
   }, [filteredData]);
   const bubbleData = useMemo(() => {
-    const contracts = ContractRules.aggregateContracts(filteredData);
+    const contracts = canonicalChartRows;
     let maxEmp = 0;
     contracts.forEach(d => {
       if (d.v_empenhado > maxEmp) maxEmp = d.v_empenhado;
@@ -9833,7 +10094,7 @@ function Dashboard() {
         color: hexColor
       };
     });
-  }, [filteredData, scatterXAxis, scatterHiddenTags]);
+  }, [canonicalChartRows, scatterXAxis, scatterHiddenTags]);
 
   // Resumo de Contadores por Quadrante do Bubble Chart
   const q1Normal = bubbleData.filter(d => d.x <= 50 && d.y <= 50).length;
@@ -10223,14 +10484,15 @@ function Dashboard() {
     key: 'p_tempo_table',
     isPercent: true
   }];
-  const masterNonMetricColCount = ['contrato', 'situacao', 'secLog', 'fornecedor', 'objeto', 'gestorFiscal', 'ao', 'po', 'nd', 'dataInic', 'dataFim', 'percTempo', 'diasPassaram', 'encerrandoDias'].filter(k => masterVisibleCols[k]).length;
-  const masterLeadingTextColCount = ['contrato', 'situacao', 'secLog', 'fornecedor', 'objeto', 'gestorFiscal'].filter(key => masterVisibleCols[key]).length;
+  const masterNonMetricColCount = ['contrato', 'arquivos', 'situacao', 'secLog', 'fornecedor', 'objeto', 'gestorFiscal', 'ao', 'po', 'nd', 'dataInic', 'dataFim', 'percTempo', 'diasPassaram', 'encerrandoDias'].filter(k => masterVisibleCols[k]).length;
+  const masterLeadingTextColCount = ['contrato', 'arquivos', 'situacao', 'secLog', 'fornecedor', 'objeto', 'gestorFiscal'].filter(key => masterVisibleCols[key]).length;
   const getMasterExportCols = () => {
     let cols = [];
     if (masterVisibleCols.contrato) cols.push({
-      header: "CONTRATO",
+      header: "CONTRATO/COMPRA",
       key: "contrato"
     });
+    if (masterVisibleCols.arquivos) cols.push(...ContractFiles.exportColumns());
     if (masterVisibleCols.situacao) cols.push({
       header: "SITUAÇÃO",
       key: "situacao"
@@ -10494,14 +10756,17 @@ function Dashboard() {
     user: currentUser,
     onClose: closeSummary
   }), /*#__PURE__*/React.createElement("header", {
-    className: "max-w-[1600px] mx-auto mb-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4"
+    className: "max-w-[1600px] mx-auto mb-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 pt-12"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
     className: "text-3xl font-black uppercase tracking-tighter text-slate-800"
   }, "PAINEL DE CONTRATOS"), /*#__PURE__*/React.createElement("p", {
     className: `text-[11px] font-bold mt-1 ${status.includes("Erro") || status.includes("falhou") || status.includes("Falha") ? "text-red-600" : "text-emerald-600"}`
   }, "\u25CF ", status), linkDiagnostics && (linkDiagnostics.ambiguos > 0 || linkDiagnostics.colunasAusentes) && /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-amber-700 mt-2"
-  }, linkDiagnostics.colunasAusentes ? "Classificação orçamentária indisponível: conferir cabeçalhos das fontes." : `${linkDiagnostics.ambiguos} registro(s) orçamentário(s) com vínculo ambíguo. Confira contrato e emitente na origem.`), metadataConflictCount > 0 && /*#__PURE__*/React.createElement("p", {
+  }, linkDiagnostics.colunasAusentes ? "Classificação orçamentária indisponível: conferir cabeçalhos das fontes." : `${linkDiagnostics.ambiguos} registro(s) orçamentário(s) com vínculo ambíguo. Confira contrato e emitente na origem.`), missingFileColumns.length > 0 && /*#__PURE__*/React.createElement("p", {
+    role: "status",
+    className: "text-xs text-amber-700 mt-2"
+  }, "A fonte de dados n\xE3o enviou todas as colunas de ARQUIVOS. Atualize a API e clique em SINCRONIZAR APIs para carregar os links."), metadataConflictCount > 0 && /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-amber-700 mt-2"
   }, metadataConflictCount, " contrato(s) com metadados divergentes na base geral. Vig\xEAncia e classifica\xE7\xE3o usam o primeiro registro; os saldos das linhas distintas foram somados.")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-3 items-center bg-white px-5 py-3 rounded-xl border border-slate-200 shadow-sm max-w-full"
@@ -10536,8 +10801,8 @@ function Dashboard() {
     className: "max-w-[1600px] mx-auto mb-6 bg-white p-5 rounded-2xl shadow-sm border border-slate-200"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mb-4 pb-4 border-b border-slate-100 flex flex-col gap-3"
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "text-[10px] font-black text-slate-400 uppercase tracking-widest"
+  }, /*#__PURE__*/React.createElement("h3", {
+    className: "filter-subtitle"
   }, "A\xE7\xF5es r\xE1pidas de contratos"), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
   }, /*#__PURE__*/React.createElement("button", {
@@ -10588,8 +10853,8 @@ function Dashboard() {
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVencidos30Active ? 'bg-red-700 text-white border-red-700 ring-2 ring-red-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VENCIDOS H\xC1 30 DIAS")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
-  }, Object.entries(tagColorsMap).map(_ref52 => {
-    let [label, config] = _ref52;
+  }, Object.entries(tagColorsMap).map(_ref57 => {
+    let [label, config] = _ref57;
     const isActive = fSituacaoTags.includes(label);
     return /*#__PURE__*/React.createElement("button", {
       key: label,
@@ -12556,13 +12821,16 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     className: "text-slate-600 uppercase font-black tracking-tighter align-top"
   }, masterVisibleCols.contrato && /*#__PURE__*/React.createElement(TextHeader, {
     widthClass: "master-text-col w-[7%]",
-    label: "Contrato",
+    label: "CONTRATO/COMPRA",
     field: "contrato",
     current: sortConfig,
     onSort: handleSort,
     searchVal: searchContrato,
     onSearchChange: setSearchContrato
-  }), masterVisibleCols.situacao && /*#__PURE__*/React.createElement(TextHeader, {
+  }), masterVisibleCols.arquivos && /*#__PURE__*/React.createElement("th", {
+    scope: "col",
+    className: "w-[76px] min-w-[76px] p-2 align-top text-center sm:w-[140px] sm:min-w-[140px]"
+  }, "ARQUIVOS"), masterVisibleCols.situacao && /*#__PURE__*/React.createElement(TextHeader, {
     widthClass: "master-text-col w-[6%]",
     label: "Situa\xE7\xE3o",
     field: "situacao",
@@ -12874,7 +13142,11 @@ Substituto: ${kpis.qtdFiscaisSub}`,
       className: "master-text-col p-3 font-black text-slate-800 break-words"
     }, row.contrato, /*#__PURE__*/React.createElement("div", {
       className: "text-[8px] font-normal text-slate-500 mt-1 leading-tight"
-    }, "Compra: ", row.compra, /*#__PURE__*/React.createElement("br", null), "Mod: ", row.modalidade)), masterVisibleCols.situacao && /*#__PURE__*/React.createElement("td", {
+    }, "Compra: ", row.compra, /*#__PURE__*/React.createElement("br", null), "Mod: ", row.modalidade)), masterVisibleCols.arquivos && /*#__PURE__*/React.createElement("td", {
+      className: "p-3 align-top"
+    }, /*#__PURE__*/React.createElement(ContractFilesCell, {
+      row: row
+    })), masterVisibleCols.situacao && /*#__PURE__*/React.createElement("td", {
       className: "master-text-col p-3 align-top"
     }, /*#__PURE__*/React.createElement("div", {
       className: "flex flex-wrap gap-1"
@@ -13107,7 +13379,7 @@ class ErrorBoundary extends React.Component {
       onClick: () => {
         clearAuthStorage();
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV5');
+        localStorage.removeItem('dashData_TotalV6');
         window.location.reload();
       },
       className: "bg-red-600 text-white px-6 py-3 rounded shadow font-bold hover:bg-red-700"
@@ -13115,6 +13387,8 @@ class ErrorBoundary extends React.Component {
     return this.props.children;
   }
 }
+
+// 7. AUTENTICAÇÃO — credenciais e token da API; regras de acesso executadas no servidor.
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(() => isAuthSessionValid());
   const [username, setUsername] = useState("");
@@ -13141,17 +13415,17 @@ function App() {
         setIsLogging(false);
         return;
       }
-      sessionStorage.setItem('token_TotalV5', json.token);
-      sessionStorage.setItem('summary_pending_TotalV5', '1');
-      sessionStorage.setItem('user_TotalV5', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
-      sessionStorage.setItem('perfil_TotalV5', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
-      sessionStorage.setItem('ativo_TotalV5', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
-      sessionStorage.setItem('validade_TotalV5', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
-      sessionStorage.setItem('duracao_diaria_horas_TotalV5', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
-      sessionStorage.setItem('expira_TotalV5', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
+      sessionStorage.setItem('token_TotalV6', json.token);
+      sessionStorage.setItem('summary_pending_TotalV6', '1');
+      sessionStorage.setItem('user_TotalV6', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
+      sessionStorage.setItem('perfil_TotalV6', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
+      sessionStorage.setItem('ativo_TotalV6', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
+      sessionStorage.setItem('validade_TotalV6', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
+      sessionStorage.setItem('duracao_diaria_horas_TotalV6', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
+      sessionStorage.setItem('expira_TotalV6', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
       try {
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV5');
+        localStorage.removeItem('dashData_TotalV6');
       } catch (e) {}
       setIsAuthenticated(true);
       setIsLogging(false);

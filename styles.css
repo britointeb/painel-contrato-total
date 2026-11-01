@@ -1,60 +1,96 @@
-/* Estilização Premium para as Barras de Scroll */
-body { font-family: 'Outfit', sans-serif; }
+/* Base e interação: fonte comum e resposta ao toque. */
+body {
+    font-family: 'Outfit', sans-serif;
+}
 
-/* Autofit: as colunas de INÍCIO em diante, inclusive AO/PO/ND, usam apenas a largura necessária. */
-.finance-detail-table {
-    width: max-content;
-    min-width: 100%;
-    table-layout: auto;
+button,
+input,
+select {
+    touch-action: manipulation;
 }
-.finance-detail-table th:not(.master-text-col),
-.finance-detail-table td:not(.master-text-col) {
-    width: 1%;
-    white-space: nowrap;
-    padding-left: 0.55rem;
-    padding-right: 0.55rem;
-    font-variant-numeric: tabular-nums;
-}
-.finance-detail-table .master-text-col {
-    width: auto;
-    min-width: 9ch;
-    max-width: 30ch;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-break: normal;
-}
-.finance-detail-table .master-code-col {
-    width: 1%;
-    min-width: 9ch;
-    max-width: 30ch;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    font-variant-numeric: tabular-nums;
-}
-.finance-detail-table .budget-detail-row td {
-    box-shadow: inset 0 1px 0 rgba(147, 197, 253, 0.35);
-}
-.chart-export-host canvas {
-    display: block;
-    width: 100% !important;
-    height: 100% !important;
-}
+
+/* Exportação: controles discretos e canvas ajustado ao contêiner. */
 .chart-export-actions {
     opacity: 0.78;
 }
-.chart-export-host:hover .chart-export-actions,
-.chart-export-actions:focus-within {
+
+.chart-export-actions:focus-within,
+.chart-export-host:hover .chart-export-actions {
     opacity: 1;
 }
-::-webkit-scrollbar { height: 8px; width: 8px; }
-::-webkit-scrollbar-track { background: #f1f5f9; }
-::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-/* Estilização Premium para as Barras de Scroll */
-::-webkit-scrollbar { height: 8px; width: 8px; }
-::-webkit-scrollbar-track { background: #f1f5f9; }
-::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-.filter-subtitle { font-size: 11px; font-weight: 900; color: #475569; text-transform: uppercase; letter-spacing: .08em; margin: 20px 0 12px; }
-input, button, select { touch-action: manipulation; }
+.chart-export-host canvas {
+    display: block;
+    height: 100% !important;
+    width: 100% !important;
+}
+
+/* Filtros: títulos de contratos, documentos, orçamento e ações rápidas. */
+.filter-subtitle {
+    color: #475569;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: .08em;
+    margin: 20px 0 12px;
+    text-transform: uppercase;
+}
+
+/* Tabelas: autofit e limites das colunas de texto, código e valores.
+   A especificidade dos seletores foi preservada para manter a cascata. */
+.finance-detail-table {
+    min-width: 100%;
+    table-layout: auto;
+    width: max-content;
+}
+
+.finance-detail-table .budget-detail-row td {
+    box-shadow: inset 0 1px 0 rgba(147, 197, 253, 0.35);
+}
+
+.finance-detail-table .master-text-col {
+    max-width: 30ch;
+    min-width: 9ch;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    width: auto;
+    word-break: normal;
+}
+
+/* Exceção à ordem alfabética: código mantém a prioridade caso um elemento
+   reúna as duas classes, como na cascata original. */
+.finance-detail-table .master-code-col {
+    font-variant-numeric: tabular-nums;
+    max-width: 30ch;
+    min-width: 9ch;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    width: 1%;
+}
+
+.finance-detail-table td:not(.master-text-col),
+.finance-detail-table th:not(.master-text-col) {
+    font-variant-numeric: tabular-nums;
+    padding-left: 0.55rem;
+    padding-right: 0.55rem;
+    white-space: nowrap;
+    width: 1%;
+}
+
+/* Scrollbars: regra única, com a mesma paleta das versões anteriores. */
+::-webkit-scrollbar {
+    height: 8px;
+    width: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f5f9;
+}
