@@ -25,6 +25,10 @@ select {
     width: 100% !important;
 }
 
+.contract-group-print {
+    display: none;
+}
+
 /* Filtros: títulos de contratos, documentos, orçamento e ações rápidas. */
 .filter-subtitle {
     color: #475569;
@@ -93,4 +97,15 @@ select {
 
 ::-webkit-scrollbar-track {
     background: #f1f5f9;
+}
+
+/* O navegador pagina somente as fichas do grupo selecionado. */
+@media print {
+    body.printing-contract-group > :not(.contract-group-print) { display: none !important; }
+    body.printing-contract-group { background: white; margin: 0; }
+    .contract-group-print { color: black; display: block; font: 11pt/1.4 Arial, sans-serif; overflow-wrap: anywhere; }
+    .contract-group-print h1 { font-size: 16pt; margin: 0 0 12pt; }
+    .contract-group-print h2 { font-size: 13pt; margin: 0 0 8pt; }
+    .contract-group-print section + section { break-before: page; }
+    .contract-group-print pre { font: inherit; tab-size: 4; white-space: pre-wrap; }
 }

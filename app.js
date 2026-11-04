@@ -1,3 +1,4 @@
+function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
 /*
  * Organização do JavaScript — as definições são carregadas antes do primeiro render.
  * 1. Dados: normalização, leitura de colunas e índices de relacionamento.
@@ -1460,9 +1461,9 @@ const normalizeStr = str => {
 
 // A API entrega somente as linhas autorizadas; a interface não amplia as permissões.
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwDf4gT-FPusNrbuXS0t-dE-LCLmqXmMVG7QX34GuQUHWc3EwjEargr1Mdi4DeXwpxf/exec";
-const DASH_CACHE_KEY = 'dashData_TotalV6_total_v6';
-const DASH_VERSION = 'V6';
-const AUTH_STORAGE_KEYS = ['summary_pending_TotalV6', 'token_TotalV6', 'user_TotalV6', 'perfil_TotalV6', 'ativo_TotalV6', 'validade_TotalV6', 'duracao_diaria_horas_TotalV6', 'expira_TotalV6'];
+const DASH_CACHE_KEY = 'dashData_TotalV7_total_v7';
+const DASH_VERSION = 'V7';
+const AUTH_STORAGE_KEYS = ['summary_pending_TotalV7', 'log_warning_TotalV7', 'log_view_TotalV7', 'token_TotalV7', 'user_TotalV7', 'perfil_TotalV7', 'ativo_TotalV7', 'validade_TotalV7', 'duracao_diaria_horas_TotalV7', 'expira_TotalV7'];
 const clearAuthStorage = () => {
   try {
     AUTH_STORAGE_KEYS.forEach(key => sessionStorage.removeItem(key));
@@ -1470,9 +1471,9 @@ const clearAuthStorage = () => {
 };
 const isAuthSessionValid = () => {
   try {
-    const token = sessionStorage.getItem('token_TotalV6');
+    const token = sessionStorage.getItem('token_TotalV7');
     if (!token) return false;
-    const expiraEm = Number(sessionStorage.getItem('expira_TotalV6') || 0);
+    const expiraEm = Number(sessionStorage.getItem('expira_TotalV7') || 0);
     if (expiraEm && Date.now() > expiraEm) {
       clearAuthStorage();
       return false;
@@ -1496,6 +1497,136 @@ const readAppsScriptJson = async (response, operationLabel) => {
     throw new Error(`O Apps Script retornou uma resposta inválida durante ${operationLabel}.${statusInfo}`);
   }
 };
+
+// Lifecycle reporting never calls the data/quota route by itself.
+const AccessLog = (() => {
+  const viewKey = 'log_view_TotalV7';
+  let view = null,
+    reloadId = '',
+    freshLogin = false,
+    leaving = false,
+    cleanup = null;
+  const id = () => {
+    var _window$crypto, _window$crypto$random;
+    return ((_window$crypto = window.crypto) === null || _window$crypto === void 0 || (_window$crypto$random = _window$crypto.randomUUID) === null || _window$crypto$random === void 0 ? void 0 : _window$crypto$random.call(_window$crypto)) || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  };
+  const read = key => {
+    try {
+      return sessionStorage.getItem(key);
+    } catch (_) {
+      return null;
+    }
+  };
+  const writeView = value => {
+    try {
+      value ? sessionStorage.setItem(viewKey, JSON.stringify(value)) : sessionStorage.removeItem(viewKey);
+    } catch (_) {}
+  };
+  const afterLogin = () => {
+    freshLogin = true;
+    reloadId = '';
+    leaving = false;
+    writeView(null);
+  };
+  const body = (event, eventId, token) => new URLSearchParams({
+    acao: 'log_acesso',
+    token,
+    evento: event,
+    evento_id: eventId
+  });
+  const beacon = payload => {
+    try {
+      var _window$navigator, _window$navigator$sen;
+      if ((_window$navigator = window.navigator) !== null && _window$navigator !== void 0 && (_window$navigator$sen = _window$navigator.sendBeacon) !== null && _window$navigator$sen !== void 0 && _window$navigator$sen.call(_window$navigator, APPS_SCRIPT_URL, payload)) return true;
+    } catch (_) {}
+    try {
+      fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        body: payload,
+        keepalive: true
+      }).catch(() => {});
+    } catch (_) {}
+    return false;
+  };
+  const start = () => {
+    var _window$performance, _window$performance$g, _previous, _previous2;
+    if (cleanup) cleanup();
+    const token = read('token_TotalV7');
+    if (!token) return () => {};
+    let previous = null;
+    try {
+      previous = JSON.parse(read(viewKey) || 'null');
+    } catch (_) {}
+    const navigation = (_window$performance = window.performance) === null || _window$performance === void 0 || (_window$performance$g = _window$performance.getEntriesByType) === null || _window$performance$g === void 0 || (_window$performance$g = _window$performance$g.call(_window$performance, 'navigation')) === null || _window$performance$g === void 0 || (_window$performance$g = _window$performance$g[0]) === null || _window$performance$g === void 0 ? void 0 : _window$performance$g.type;
+    reloadId = !freshLogin && navigation === 'reload' ? ((_previous = previous) === null || _previous === void 0 ? void 0 : _previous.token) === token && (_previous2 = previous) !== null && _previous2 !== void 0 && _previous2.id ? 'view_' + previous.id : 'reload_' + id() : '';
+    freshLogin = false;
+    leaving = false;
+    view = {
+      id: id(),
+      token
+    };
+    writeView(view);
+    const pagehide = event => {
+      var _view;
+      if (leaving || event.persisted || read('token_TotalV7') !== ((_view = view) === null || _view === void 0 ? void 0 : _view.token)) return;
+      leaving = true;
+      beacon(body('FECHAR_TELA', 'view_' + view.id, view.token));
+    };
+    const pageshow = event => {
+      var _view2;
+      if (event.persisted && read('token_TotalV7') === ((_view2 = view) === null || _view2 === void 0 ? void 0 : _view2.token)) {
+        leaving = false;
+        writeView(view);
+      }
+    };
+    window.addEventListener('pagehide', pagehide);
+    window.addEventListener('pageshow', pageshow);
+    cleanup = () => {
+      window.removeEventListener('pagehide', pagehide);
+      window.removeEventListener('pageshow', pageshow);
+      cleanup = null;
+    };
+    return cleanup;
+  };
+  const dataEvent = manual => manual ? {
+    evento: 'SINCRONIZACAO_API',
+    evento_id: 'sync_' + id()
+  } : reloadId ? {
+    evento: 'ATUALIZAR_TELA',
+    evento_id: reloadId
+  } : {};
+  const logout = async () => {
+    if (leaving) return;
+    leaving = true;
+    writeView(null);
+    const token = read('token_TotalV7');
+    if (!token) return;
+    const payload = body('SAIR', 'logout_' + id(), token);
+    // Bounded acknowledgement; a beacon retries the same event ID if needed.
+    let timer;
+    try {
+      const response = await Promise.race([fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        body: payload,
+        keepalive: true
+      }).then(response => readAppsScriptJson(response, 'o registro da saída')), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), 4000);
+      })]);
+      if (!response.ok) beacon(payload);
+    } catch (_) {
+      beacon(payload);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  return Object.freeze({
+    id,
+    afterLogin,
+    start,
+    dataEvent,
+    logout
+  });
+})();
 const parseValue = UnifiedData.number;
 const parsePercentAsFloat = UnifiedData.percentNumber;
 const formatBRL = UnifiedData.brl;
@@ -1532,6 +1663,56 @@ const counterpartyUrl = (name, identifier) => {
   const cnpj = getFornecedorCnpj(name) || getFornecedorCnpj(identifier);
   return cnpj ? 'https://portaldatransparencia.gov.br/pessoa-juridica/' + cnpj : '';
 };
+const formatCnpj = id => id.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
+const supplierWithoutCnpj = (value, id) => String(value).replace(formatCnpj(id), '').replace(id, '').replace(/^[\s/–-]+|[\s/–-]+$/g, '').trim();
+
+// A Geral pode trazer reticências no próprio valor. Só completar com dados da carga autorizada
+// e com o CNPJ inteiro da mesma pessoa jurídica, nunca por semelhança entre nomes.
+function supplierNameResolver(general, budget, ledger) {
+  let registered = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
+  const truncated = /(?:\.{3,}|…)/;
+  const supplierColumn = general[0].findIndex(h => UnifiedData.key(h) === 'FORNECEDOR');
+  const needed = new Set();
+  for (const row of general.slice(1)) {
+    if (truncated.test(row[supplierColumn] || '')) needed.add(getFornecedorCnpj(row[supplierColumn]));
+  }
+  needed.delete('');
+  const candidates = new Map();
+  if (needed.size) {
+    for (const [rows, names, identifiers] of [[general, ['Fornecedor'], []], [budget, ['Favorecido', 'Fornecedor'], ['CNPJ Favorecido']], [ledger, ['Favorecido Doc. Nome', 'Favorecido'], ['Favorecido Doc. Código', 'Favorecido Doc. CNPJ', 'CNPJ Favorecido']]]) {
+      const read = UnifiedData.compileReaders((rows === null || rows === void 0 ? void 0 : rows[0]) || [], {
+        name: {
+          names
+        },
+        id: {
+          names: identifiers
+        }
+      }, v => String(v ?? '').trim().toUpperCase());
+      for (let i = 1; i < ((rows === null || rows === void 0 ? void 0 : rows.length) || 0); i++) {
+        const value = read.name(rows[i]);
+        if (!value || truncated.test(value)) continue;
+        const id = getFornecedorCnpj(value + ' ' + read.id(rows[i]));
+        if (!needed.has(id)) continue;
+        const name = supplierWithoutCnpj(value, id);
+        if (!name || ['-', 'N/I'].includes(name)) continue;
+        if (!candidates.has(id)) candidates.set(id, new Set());
+        candidates.get(id).add(name);
+      }
+    }
+  }
+  return original => {
+    const value = String(original || 'N/I').toUpperCase();
+    if (!truncated.test(value)) return value;
+    const id = getFornecedorCnpj(value);
+    const names = [...(candidates.get(id) || [])];
+    if (!names.length && registered !== null && registered !== void 0 && registered[id]) names.push(String(registered[id]).trim().toUpperCase());
+    if (!names.length) return value.replace(truncated, ' [nome incompleto na origem]');
+    const prefix = UnifiedData.normalize(supplierWithoutCnpj(value, id).split(truncated)[0]);
+    const matches = names.filter(name => UnifiedData.normalize(name).startsWith(prefix));
+    const full = (matches.length ? matches : names).reduce((best, name) => best.length >= name.length ? best : name);
+    return `${formatCnpj(id)} - ${full}`;
+  };
+}
 function ContractFileIcon(_ref9) {
   let {
     kind
@@ -1695,6 +1876,7 @@ const shortenNumber = num => {
 const parseDateBR = UnifiedData.date;
 const formatLabelMultiLine = function (text) {
   let maxLength = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 18;
+  let keepFull = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
   if (!text) return [""];
   let cleanText = text.replace(/^\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\s*-\s*/, '');
   if (cleanText.length <= maxLength) return [cleanText];
@@ -1710,7 +1892,7 @@ const formatLabelMultiLine = function (text) {
     }
   });
   if (currentLine) lines.push(currentLine.trim());
-  if (lines.length > 2) return [lines[0], lines[1].substring(0, maxLength - 3) + '...'];
+  if (!keepFull && lines.length > 2) return [lines[0], lines[1].substring(0, maxLength - 3) + '...'];
   return lines;
 };
 const getExportMetadata = () => {
@@ -2682,6 +2864,7 @@ function ToggleableChartCard(_ref25) {
     return processed;
   }, [data, isFornecedor, activeMetric]);
   const chartData = useMemo(() => {
+    var _sortedData$;
     if (sortedData.length <= 10) return sortedData;
     const top9 = sortedData.slice(0, 9);
     const others = sortedData.slice(9).reduce((acc, curr) => {
@@ -2712,9 +2895,17 @@ function ToggleableChartCard(_ref25) {
       cancelado: 0,
       executado: 0
     });
+    if ((_sortedData$ = sortedData[0]) !== null && _sortedData$ !== void 0 && _sortedData$.budgetTooltip) {
+      const grouped = sortedData.slice(9);
+      others.budgetTooltip = ['OUTROS', ...grouped.slice(0, 4).map(item => {
+        var _item$budgetTooltip;
+        return ((_item$budgetTooltip = item.budgetTooltip) === null || _item$budgetTooltip === void 0 ? void 0 : _item$budgetTooltip[0]) || item.label;
+      })];
+      if (grouped.length > 4) others.budgetTooltip.push(`Mais ${grouped.length - 4} código(s). Consulte a tabela.`);
+    }
     return [...top9, others];
   }, [sortedData]);
-  const chartLabels = chartData.map(d => formatLabelMultiLine(d.label, 15));
+  const chartLabels = chartData.map(d => formatLabelMultiLine(d.label, 15, isFornecedor));
   const displayedValues = sortedData.map(d => d[activeMetric] || 0);
   const displayedTotal = displayedValues.reduce((sum, value) => sum + value, 0);
   const totalCount = sortedData.reduce((sum, item) => sum + (item.count || 0), 0);
@@ -2813,8 +3004,8 @@ function ToggleableChartCard(_ref25) {
       tooltip: {
         callbacks: {
           title: function (context) {
-            var _context$;
-            return ((_context$ = context[0]) === null || _context$ === void 0 ? void 0 : _context$.label) || '';
+            var _chartData$context$0$, _context$, _context$2;
+            return ((_chartData$context$0$ = chartData[(_context$ = context[0]) === null || _context$ === void 0 ? void 0 : _context$.dataIndex]) === null || _chartData$context$0$ === void 0 ? void 0 : _chartData$context$0$.budgetTooltip) || ((_context$2 = context[0]) === null || _context$2 === void 0 ? void 0 : _context$2.label) || '';
           },
           label: function (context) {
             const item = chartData[context.dataIndex];
@@ -2842,7 +3033,7 @@ function ToggleableChartCard(_ref25) {
                 const style = meta.controller.getStyle(i);
                 const maxLen = data.labels.length > 6 ? 12 : 18;
                 return {
-                  text: label.length > maxLen ? label.substring(0, maxLen) + '...' : label,
+                  text: !isFornecedor && label.length > maxLen ? label.substring(0, maxLen) + '...' : label,
                   fillStyle: style.backgroundColor,
                   strokeStyle: style.borderColor,
                   lineWidth: style.borderWidth,
@@ -2905,8 +3096,9 @@ function ToggleableChartCard(_ref25) {
       tooltip: {
         callbacks: {
           title: function (context) {
-            var _chartData$context$0$, _context$2;
-            return ((_chartData$context$0$ = chartData[(_context$2 = context[0]) === null || _context$2 === void 0 ? void 0 : _context$2.dataIndex]) === null || _chartData$context$0$ === void 0 ? void 0 : _chartData$context$0$.label) || '';
+            var _context$3;
+            const item = chartData[(_context$3 = context[0]) === null || _context$3 === void 0 ? void 0 : _context$3.dataIndex];
+            return (item === null || item === void 0 ? void 0 : item.budgetTooltip) || (item === null || item === void 0 ? void 0 : item.label) || '';
           },
           label: function (context) {
             const item = chartData[context.dataIndex];
@@ -2947,6 +3139,7 @@ function ToggleableChartCard(_ref25) {
           autoSkip: false,
           callback: function (value) {
             const label = this.getLabelForValue(value);
+            if (isFornecedor) return label;
             if (Array.isArray(label)) {
               return label.map(l => l.length > 15 ? l.substring(0, 15) + '...' : l);
             }
@@ -3131,11 +3324,12 @@ function SortableChartTable(_ref27) {
     title,
     rows,
     columns,
-    initialSortKey
+    initialSortKey,
+    initialSortDirection = 'desc'
   } = _ref27;
   const [sort, setSort] = useState({
     key: initialSortKey || ((_columns$ = columns[0]) === null || _columns$ === void 0 ? void 0 : _columns$.key),
-    direction: 'desc'
+    direction: initialSortDirection
   });
   const sortedRows = useMemo(() => {
     const column = columns.find(item => item.key === sort.key) || columns[0];
@@ -3495,7 +3689,7 @@ function MultiSelect(_ref33) {
     onChange: () => toggleOption(o),
     className: "mr-2 cursor-pointer"
   }), /*#__PURE__*/React.createElement("span", {
-    className: "truncate leading-tight",
+    className: label === 'FORNECEDOR' ? 'whitespace-normal break-words leading-tight' : 'truncate leading-tight',
     title: o
   }, o))))));
 }
@@ -5396,7 +5590,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           geralDict[UnifiedData.key(contrato)] = {
             contrato,
             files: filesByContract.get(UnifiedData.key(contrato)) || ContractFiles.empty,
-            fornecedor: getVG(["Fornecedor"], [], row).toUpperCase() || "N/I",
+            fornecedor: (canonicalContract === null || canonicalContract === void 0 ? void 0 : canonicalContract.fornecedor) || getVG(["Fornecedor"], [], row).toUpperCase() || "N/I",
             fiscal: getVG(["FISCAL_TITULAR", "Fiscal Titular"], ["fiscal"], row).toUpperCase() || "N/I",
             gestor: getVG(["GESTOR_TITULAR", "Gestor Titular"], ["gestor"], row).toUpperCase() || "N/I",
             fiscal_sub: getVG(["FISCAL_SUBSTITUTO", "Fiscal Substituto"], ["fiscal sub"], row).toUpperCase() || "N/I",
@@ -6963,7 +7157,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
       totals: totalsMaster,
       countSoGeral,
       countSoContabil,
-      actions: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      contractActions: /*#__PURE__*/React.createElement("div", {
         className: "flex flex-wrap gap-2"
       }, "                        ", /*#__PURE__*/React.createElement("button", {
         title: QuickActionHelp.onlyGeneral,
@@ -6973,9 +7167,8 @@ const DocumentModule = ((sharedExports, sharedChart) => {
         title: QuickActionHelp.onlyAccounting,
         onClick: () => toggleExistencia('CONTÁBIL'),
         className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${fExistencia.includes('CONTÁBIL') ? tagColorsMap['SÓ EM CONTÁBIL'].css + ' border-transparent shadow-inner ring-2 ring-orange-400 ring-offset-1' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`
-      }, "S\xD3 CONT\xC1BIL")), /*#__PURE__*/React.createElement("h3", {
-        className: "filter-subtitle"
-      }, "Documentos e movimentos"), /*#__PURE__*/React.createElement("div", {
+      }, "S\xD3 CONT\xC1BIL")),
+      actions: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
         className: "flex flex-wrap gap-2"
       }, "                        ", /*#__PURE__*/React.createElement("button", {
         title: QuickActionHelp.documents(7, ps7Doc, ts),
@@ -7003,9 +7196,7 @@ const DocumentModule = ((sharedExports, sharedChart) => {
           className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isActive ? activeClass : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
         }, mov);
       }))),
-      filters: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("h3", {
-        className: "filter-subtitle"
-      }, "Documentos"), /*#__PURE__*/React.createElement("div", {
+      filters: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
         className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-4"
       }, "                    ", /*#__PURE__*/React.createElement(MultiSelect, {
         label: "EMITENTE",
@@ -8214,6 +8405,679 @@ const DocumentModule = ((sharedExports, sharedChart) => {
     useDashboard
   };
 })(exportTable, ChartComponent);
+function FilterGroup(_ref53) {
+  let {
+    title,
+    open,
+    onToggle,
+    children
+  } = _ref53;
+  const id = 'filtro-' + UnifiedData.key(title);
+  return /*#__PURE__*/React.createElement("section", null, /*#__PURE__*/React.createElement("h3", {
+    className: "filter-subtitle"
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    "aria-expanded": open,
+    "aria-controls": id,
+    onClick: onToggle,
+    className: "flex w-full items-center justify-between rounded border-b border-slate-200 pb-2 text-left uppercase tracking-wider hover:text-blue-700"
+  }, title, /*#__PURE__*/React.createElement("span", {
+    "aria-hidden": "true",
+    className: "inline-block w-6 shrink-0 text-center text-lg leading-none"
+  }, open ? '▾' : '▸'))), /*#__PURE__*/React.createElement("div", {
+    id: id,
+    hidden: !open
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-col gap-3"
+  }, children)));
+}
+function budgetChartGroups(details) {
+  const groups = {
+    ao: new Map(),
+    aoPo: new Map(),
+    grupo: new Map(),
+    nd: new Map()
+  };
+  const groupNames = {
+    '3': 'Outras Despesas Correntes',
+    '4': 'Investimentos'
+  };
+  for (const detail of details) {
+    var _UnifiedData$ndParts$;
+    const ao = detail.ao_codigo || 'N/I',
+      po = detail.po_codigo || 'N/I';
+    const nd = detail.nd_codigo || 'N/I';
+    const grupo = ((_UnifiedData$ndParts$ = UnifiedData.ndParts(detail)[0]) === null || _UnifiedData$ndParts$ === void 0 ? void 0 : _UnifiedData$ndParts$.grupo) || 'N/I';
+    const dimensions = [['ao', ao, detail.ao_nome], ['aoPo', `${ao}-${po}`, `AO: ${detail.ao_nome || 'N/I'} · PO: ${detail.po_nome || 'N/I'}`], ['grupo', grupo, groupNames[grupo]], ['nd', nd, detail.nd_nome]];
+    for (const [key, label, name] of dimensions) {
+      const map = groups[key];
+      if (!map.has(label)) map.set(label, {
+        label,
+        contracts: new Set(),
+        descriptions: new Set(),
+        total: 0,
+        recebido: 0,
+        a_receber: 0,
+        liquidado: 0,
+        a_liquidar: 0,
+        pago: 0,
+        a_pagar: 0,
+        bloqueado: 0,
+        cancelado: 0,
+        executado: 0
+      });
+      const target = map.get(label);
+      target.contracts.add(UnifiedData.key(detail.contrato));
+      target.descriptions.add(`${label} – ${name && name !== 'N/I' ? name : 'Nome não informado'}`);
+      target.total += detail.v_empenhado || 0;
+      target.recebido += detail.v_recebido || 0;
+      target.a_receber += (detail.v_empenhado || 0) - (detail.v_recebido || 0);
+      target.liquidado += detail.v_liquidado || 0;
+      target.a_liquidar += detail.v_a_liquidar || 0;
+      target.pago += detail.v_pago || 0;
+      target.a_pagar += detail.v_a_pagar || 0;
+      target.bloqueado += detail.v_bloqueado || 0;
+      target.cancelado += detail.v_cancelado || 0;
+      target.executado += detail.v_executado || 0;
+    }
+  }
+  return Object.fromEntries(Object.entries(groups).map(_ref54 => {
+    let [key, map] = _ref54;
+    return [key, [...map.values()].map(item => ({
+      ...item,
+      count: item.contracts.size,
+      budgetTooltip: [...item.descriptions]
+    }))];
+  }));
+}
+function auditContracts(contracts, missingColumns) {
+  let commitments = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : new Map();
+  let now = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : new Date();
+  const result = {
+    values: [],
+    subitems: [],
+    links: [],
+    time: [],
+    commitments: [],
+    aoPo: [],
+    ending: []
+  };
+  const {
+    today,
+    future30
+  } = ContractRules.bounds(now);
+  const available = ContractFiles.fields.filter(field => !missingColumns.includes(field.column));
+  for (const row of contracts) {
+    var _UnifiedData$date;
+    const difference = ContractRules.cents(row.v_global) - ContractRules.cents(row.v_empenhado);
+    if (difference) result.values.push({
+      ...row,
+      difference: difference / 100
+    });
+    const subitems = new Map();
+    const pairs = new Set();
+    for (const detail of row.orc_detail_rows || []) {
+      const ao = String(detail.ao_codigo ?? '').trim(),
+        po = String(detail.po_codigo ?? '').trim();
+      if (ao && po && !['N/I', '-'].includes(ao) && !['N/I', '-'].includes(po)) pairs.add(ao + '-' + po);
+      for (const part of UnifiedData.ndParts(detail)) {
+        if (!part.subelemento) continue;
+        const id = `${part.elemento}.${part.subelemento}`;
+        if (!subitems.has(id) || subitems.get(id) === 'N/I') subitems.set(id, part.name);
+      }
+    }
+    if (subitems.size > 1) result.subitems.push({
+      ...row,
+      count: subitems.size,
+      detail: [...subitems].sort().map(_ref55 => {
+        let [code, name] = _ref55;
+        return `${code} – ${name}`;
+      }).join('; ')
+    });
+    const missing = available.filter(field => !ContractFiles.get(row, field.key));
+    if (missing.length) result.links.push({
+      ...row,
+      count: missing.length,
+      detail: missing.map(field => field.label).join(', ')
+    });
+    if (Number.isFinite(row.perc_tempo) && row.perc_tempo > row.p_recebido) result.time.push(row);
+    const notes = commitments.get(UnifiedData.key(row.contrato));
+    if ((notes === null || notes === void 0 ? void 0 : notes.numbers.length) > 1) result.commitments.push({
+      ...row,
+      count: notes.numbers.length,
+      detail: notes.numbers.join('; ')
+    });
+    if (pairs.size > 1) result.aoPo.push({
+      ...row,
+      count: pairs.size,
+      detail: [...pairs].sort().join('; ')
+    });
+    const end = row.dtFimVal || ((_UnifiedData$date = UnifiedData.date(row.data_fim)) === null || _UnifiedData$date === void 0 ? void 0 : _UnifiedData$date.getTime());
+    if (end >= today && end <= future30) result.ending.push({
+      ...row,
+      daysLeft: Math.round((end - today) / 86400000)
+    });
+  }
+  return result;
+}
+function AuditPage(_ref56) {
+  let {
+    contracts,
+    missingColumns,
+    notes,
+    sectionProps
+  } = _ref56;
+  const day = new Date().setHours(0, 0, 0, 0);
+  const audit = useMemo(() => auditContracts(contracts, missingColumns, notes, new Date(day)), [contracts, missingColumns, notes, day]);
+  const base = [{
+    header: 'Contrato',
+    key: 'contrato',
+    align: 'left'
+  }, {
+    header: 'Fornecedor',
+    key: 'fornecedor',
+    align: 'left',
+    render: row => /*#__PURE__*/React.createElement(CounterpartyLink, {
+      name: row.fornecedor,
+      title: "Abrir fornecedor no Portal da Transpar\xEAncia"
+    })
+  }];
+  const reports = [['values', 'Valor global diferente do empenhado', [{
+    header: 'Valor global',
+    key: 'v_global',
+    isCurrency: true
+  }, {
+    header: 'Empenhado',
+    key: 'v_empenhado',
+    isCurrency: true
+  }, {
+    header: 'Diferença',
+    key: 'difference',
+    isCurrency: true
+  }]], ['subitems', 'Mais de um subelemento', [{
+    header: 'Quantidade',
+    key: 'count'
+  }, {
+    header: 'Elemento.Subitem e nome',
+    key: 'detail',
+    align: 'left'
+  }]], ['links', 'Links ausentes em ARQUIVOS', [{
+    header: 'Quantidade',
+    key: 'count'
+  }, {
+    header: 'Arquivos sem link válido',
+    key: 'detail',
+    align: 'left'
+  }]], ['time', '% Tempo maior que % Recebido', [{
+    header: '% Tempo',
+    key: 'perc_tempo',
+    isPercent: true
+  }, {
+    header: '% Recebido',
+    key: 'p_recebido',
+    isPercent: true
+  }]], ['commitments', 'Contratos com mais de um empenho', [{
+    header: 'Quantidade',
+    key: 'count'
+  }, {
+    header: 'Notas de empenho',
+    key: 'detail',
+    align: 'left'
+  }]], ['aoPo', 'Contratos com mais de uma AO-PO', [{
+    header: 'Quantidade',
+    key: 'count'
+  }, {
+    header: 'Pares AO-PO',
+    key: 'detail',
+    align: 'left'
+  }]], ['ending', 'Contratos vencendo em 30 dias', [{
+    header: 'Dias restantes',
+    key: 'daysLeft'
+  }, {
+    header: 'Fim da vigência',
+    key: 'data_fim',
+    align: 'left'
+  }]]];
+  return /*#__PURE__*/React.createElement(CollapsibleSection, _extends({
+    title: "Painel de auditorias",
+    defaultOpen: true
+  }, sectionProps), /*#__PURE__*/React.createElement("p", {
+    className: "mb-4 text-sm text-slate-600"
+  }, contracts.length, " contrato(s) da base Geral no recorte atual. A confer\xEAncia usa os totais e as classifica\xE7\xF5es de cada contrato."), reports.map(_ref57 => {
+    let [key, title, columns] = _ref57;
+    return /*#__PURE__*/React.createElement(CollapsibleSection, _extends({
+      key: key,
+      title: `${title} (${audit[key].length})`,
+      defaultOpen: true
+    }, sectionProps), key === 'links' && missingColumns.length > 0 && /*#__PURE__*/React.createElement("p", {
+      className: "mb-2 text-sm text-amber-700"
+    }, "Colunas indispon\xEDveis para confer\xEAncia: ", missingColumns.join(', '), "."), audit[key].length > 0 ? /*#__PURE__*/React.createElement(SortableChartTable, {
+      id: 'Auditoria_' + key,
+      title: title,
+      rows: audit[key],
+      columns: [...base, ...columns],
+      initialSortKey: columns[0].key,
+      initialSortDirection: key === 'ending' ? 'asc' : 'desc'
+    }) : /*#__PURE__*/React.createElement("p", {
+      className: "rounded-lg bg-white p-4 text-sm text-slate-600"
+    }, key === 'links' && missingColumns.length === ContractFiles.fields.length ? 'A fonte não enviou as colunas de arquivos.' : 'Nenhuma ocorrência identificada no recorte atual.'));
+  }));
+}
+const BasicContract = (() => {
+  const fields = ['Nr Contrato/Objeto', 'Nr Processo de Seleção/Nr Compra/Modalidade', 'Contratada – Nome/CNPJ', 'Gestor do Contrato/Contato (Telefone+e-mail)', 'Fiscal do Contrato/Contato (Telefone+e-mail)', 'Objeto/Quantidade', 'Valor Total do Contrato', 'Assinatura', 'Vigência', 'Notas de Empenho'];
+  const views = {
+    gestor: 'Gestor titular',
+    gestor_sub: 'Gestor substituto',
+    fiscal: 'Fiscal titular',
+    fiscal_sub: 'Fiscal substituto',
+    sec_log: 'SEC LOG',
+    fornecedor: 'Fornecedor'
+  };
+  const clean = value => value && !['-', 'N/I', '--'].includes(String(value).trim()) ? String(value).trim() : 'Não informado';
+  const dateText = value => {
+    var _UnifiedData$date2;
+    return ((_UnifiedData$date2 = UnifiedData.date(value)) === null || _UnifiedData$date2 === void 0 ? void 0 : _UnifiedData$date2.toLocaleDateString('pt-BR')) || '';
+  };
+  const calendarDay = date => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000;
+  function dated(value, today, end) {
+    const date = UnifiedData.date(value);
+    if (!date) return 'Não informada';
+    const days = calendarDay(date) - calendarDay(today),
+      count = Math.abs(days);
+    const duration = `${count} ${count === 1 ? 'dia' : 'dias'}`;
+    let note = 'hoje';
+    if (days > 0) note = `${count === 1 ? 'falta' : 'faltam'} ${duration}`;
+    if (days < 0) note = end ? `encerrada há ${duration}` : `${count === 1 ? 'passou' : 'passaram'} ${duration}`;
+    return `${date.toLocaleDateString('pt-BR')} (${note})`;
+  }
+  function supplier(value) {
+    const id = getFornecedorCnpj(value);
+    if (!id) return `${clean(value)} / CNPJ não informado`;
+    return `${clean(supplierWithoutCnpj(value, id))} / ${formatCnpj(id)}`;
+  }
+  // A NE completa já identifica UG e gestão. Para números curtos, usar a UG da linha.
+  // Se faltar UG e houver mais de uma candidata, não atribuir os dados a outra unidade.
+  function commitments() {
+    let budget = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : [];
+    let documents = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
+    const byContract = new Map();
+    const scope = ['year', 'unit', 'gestao'];
+    const specificity = entry => scope.filter(field => entry[field]).length;
+    function note(contract, number, unit, management) {
+      const contractId = UnifiedData.key(contract),
+        ne = UnifiedData.key(number);
+      const parsed = ne.match(/^(?:(\d{6})(\d{5}))?(\d{4})?NE(\d{1,6})$/);
+      if (!contractId || !parsed) return null;
+      if (!byContract.has(contractId)) byContract.set(contractId, new Map());
+      const byNumber = byContract.get(contractId);
+      const suffix = parsed[4].padStart(6, '0');
+      if (!byNumber.has(suffix)) byNumber.set(suffix, new Map());
+      const byUnit = byNumber.get(suffix);
+      const year = parsed[3] || '';
+      const ug = parsed[1] || (UnifiedData.key(unit) === 'NI' ? '' : UnifiedData.key(unit));
+      const gestao = parsed[2] || (/^\d{1,5}$/.test(management) ? String(management).padStart(5, '0') : '');
+      const id = [year, ug, gestao].join('|');
+      if (!byUnit.has(id)) byUnit.set(id, {
+        number,
+        year,
+        unit: ug,
+        gestao,
+        dates: new Set(),
+        ledgerDates: new Set(),
+        codes: new Set(),
+        budget: null,
+        ledger: null
+      });
+      if (parsed[1]) byUnit.get(id).number = ne;
+      return byUnit.get(id);
+    }
+    for (const row of documents) {
+      const entry = note(row.contrato, row.empenho, row.portal_ug || row.ug, row.gestao);
+      if (!entry) continue;
+      if (row.has_empenhado || row.v_empenhado) entry.ledger = (entry.ledger ?? 0) + row.v_empenhado;
+      if (UnifiedData.key(row.documento) === UnifiedData.key(row.empenho) && dateText(row.dia)) entry.ledgerDates.add(dateText(row.dia));
+    }
+    const read = UnifiedData.compileReaders((budget === null || budget === void 0 ? void 0 : budget[0]) || [], {
+      contract: {
+        names: ['COL_NR_CONTR_BASE', 'Contrato', 'Número Contrato']
+      },
+      number: {
+        names: ['Documento CCor Número', 'DOCUMENTO_CCOR_NUMERO']
+      },
+      unit: {
+        names: ['Emitente - UG Código', 'UG Emitente', 'UG Código']
+      },
+      management: {
+        names: ['Gestão Emitente', 'Gestão Código']
+      },
+      date: {
+        names: ['DATA ORIGINAL', 'Data do Empenho']
+      },
+      nd: {
+        names: ['ND_DOC', 'ND Código']
+      },
+      amount: {
+        names: ['TOTAL EMPENHADO']
+      }
+    });
+    for (const row of (budget || []).slice(1)) {
+      const entry = note(read.contract(row), read.number(row), read.unit(row), read.management(row));
+      if (!entry) continue;
+      const date = dateText(read.date(row)),
+        value = read.amount(row);
+      if (date) entry.dates.add(date);
+      UnifiedData.ndParts({
+        nd_codigo: read.nd(row)
+      }).forEach(part => entry.codes.add(part.code));
+      if (value && value !== '-') entry.budget = (entry.budget ?? 0) + UnifiedData.number(value);
+    }
+    const result = new Map();
+    for (const [contract, numbers] of byContract) {
+      const notes = [];
+      for (const units of numbers.values()) {
+        // Resolver registros parciais do mais específico ao menos específico.
+        for (const [key, entry] of [...units].sort((a, b) => specificity(b[1]) - specificity(a[1]))) {
+          const knownFields = scope.filter(field => entry[field]);
+          if (knownFields.length === scope.length) continue;
+          const possible = [...units.values()].filter(other => specificity(other) > knownFields.length && knownFields.every(field => other[field] === entry[field]));
+          if (possible.length > 1) {
+            entry.ambiguous = true;
+            continue;
+          }
+          if (possible.length !== 1) continue;
+          const known = possible[0];
+          for (const field of ['dates', 'ledgerDates', 'codes']) entry[field].forEach(v => known[field].add(v));
+          for (const field of ['budget', 'ledger']) if (entry[field] !== null) known[field] = (known[field] ?? 0) + entry[field];
+          units.delete(key);
+        }
+        for (const entry of units.values()) {
+          const dates = entry.dates.size ? entry.dates : entry.ledgerDates;
+          const value = entry.budget ?? entry.ledger;
+          const number = units.size > 1 ? `${entry.number} (UG ${entry.unit || 'não informada'}${entry.gestao ? ', gestão ' + entry.gestao : ''})` : entry.number;
+          notes.push({
+            number,
+            ambiguous: entry.ambiguous,
+            text: [number, [...dates].join(', ') || 'Data não informada', [...entry.codes].sort().join(', ') || 'ND não informada', value === null ? 'Valor não informado' : formatBRL(value)].join(' – ')
+          });
+        }
+      }
+      notes.sort((a, b) => a.number.localeCompare(b.number, 'pt-BR', {
+        numeric: true
+      }));
+      result.set(contract, {
+        numbers: notes.filter(note => !note.ambiguous).map(note => note.number),
+        text: notes.map(note => note.text).join('; ')
+      });
+    }
+    return result;
+  }
+  function values(row, notes) {
+    var _notes$get;
+    let today = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : new Date();
+    const contact = name => `${clean(name)} (61-2035-5486 / Completar com e-mail)`;
+    return [`${row.contrato} / ${clean(row.objeto)}`, `${clean(row.processo)} / ${clean(row.compra)} / ${clean(row.modalidade)}`, supplier(row.fornecedor), contact(row.gestor), contact(row.fiscal), '', `${formatBRL(row.v_global)} (Recebido: ${formatBRL(row.v_recebido)} – Liquidado: ${formatBRL(row.v_liquidado)} – Pago: ${formatBRL(row.v_pago)})`, dated(row.data_inic, today, false), dated(row.data_fim, today, true), ((_notes$get = notes.get(UnifiedData.key(row.contrato))) === null || _notes$get === void 0 ? void 0 : _notes$get.text) || 'Nenhuma nota de empenho vinculada'];
+  }
+  function asText(data) {
+    const paragraphs = fields.map((field, i) => {
+      const value = String(data[i] ?? '').replace(/\r\n|\r|\n/g, '\r\n\t');
+      return `${String.fromCharCode(97 + i)}.\t${field}:${value ? ' ' + value : ''}`;
+    });
+    return paragraphs.join('\r\n\r\n') + '\r\n';
+  }
+  function downloadText(filename, text) {
+    const blob = new Blob(['\uFEFF', text], {
+      type: 'text/plain;charset=utf-8'
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    try {
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+    } finally {
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+  }
+  function download(row, data) {
+    downloadText(`Ficha_Contrato_${sanitizeFilename(row.contrato)}.txt`, asText(data));
+  }
+  function groupTitle(view, name, count) {
+    return `${views[view]} · ${name} (${count})`;
+  }
+  function downloadGroup(view, name, records) {
+    const title = groupTitle(view, name, records.length);
+    const separator = '\r\n' + '─'.repeat(48) + '\r\n\r\n';
+    downloadText(`Fichas_${sanitizeFilename(views[view])}_${sanitizeFilename(name)}.txt`, title + '\r\n\r\n' + records.map(_ref58 => {
+      let {
+        data
+      } = _ref58;
+      return asText(data);
+    }).join(separator));
+  }
+  return {
+    fields,
+    views,
+    commitments,
+    values,
+    asText,
+    download,
+    groupTitle,
+    downloadGroup
+  };
+})();
+function BasicPage(_ref59) {
+  let {
+    contracts,
+    notes = new Map(),
+    sectionProps
+  } = _ref59;
+  const [view, setView] = useState('gestor'),
+    [error, setError] = useState('');
+  const [closedByView, setClosedByView] = useState({});
+  const [printJob, setPrintJob] = useState(null);
+  useEffect(() => {
+    if (!printJob) return;
+    const reset = () => setPrintJob(null);
+    document.body.classList.add('printing-contract-group');
+    window.addEventListener('afterprint', reset);
+    try {
+      window.print();
+    } catch {
+      setError('O navegador não conseguiu abrir a impressão do grupo.');
+      reset();
+    }
+    return () => {
+      document.body.classList.remove('printing-contract-group');
+      window.removeEventListener('afterprint', reset);
+    };
+  }, [printJob]);
+  const day = new Date().setHours(0, 0, 0, 0);
+  const records = useMemo(() => {
+    const today = new Date(day);
+    return contracts.map(row => ({
+      row,
+      data: BasicContract.values(row, notes, today)
+    })).sort((a, b) => a.row.contrato.localeCompare(b.row.contrato, 'pt-BR', {
+      numeric: true
+    }));
+  }, [contracts, notes, day]);
+  const groups = useMemo(() => {
+    const map = new Map();
+    for (const record of records) {
+      const name = record.row[view] || 'N/I';
+      if (!map.has(name)) map.set(name, []);
+      map.get(name).push(record);
+    }
+    return [...map].sort((_ref60, _ref61) => {
+      let [a] = _ref60;
+      let [b] = _ref61;
+      return a.localeCompare(b, 'pt-BR', {
+        numeric: true
+      });
+    });
+  }, [records, view]);
+  const isClosed = name => {
+    var _closedByView$view;
+    return !!((_closedByView$view = closedByView[view]) !== null && _closedByView$view !== void 0 && _closedByView$view.has(name));
+  };
+  const allOpen = groups.every(_ref62 => {
+    let [name] = _ref62;
+    return !isClosed(name);
+  });
+  function setGroupsClosed(names, closed) {
+    setClosedByView(previous => {
+      const next = new Set(previous[view]);
+      for (const name of names) {
+        if (closed) next.add(name);else next.delete(name);
+      }
+      return {
+        ...previous,
+        [view]: next
+      };
+    });
+  }
+  function exportRow(row, data) {
+    setError('');
+    try {
+      BasicContract.download(row, data);
+    } catch {
+      setError(`O navegador não conseguiu baixar a ficha TXT do contrato ${row.contrato}. Tente novamente.`);
+    }
+  }
+  const txtButton = 'rounded bg-slate-600 px-3 py-2 font-bold text-white hover:bg-slate-700';
+  return /*#__PURE__*/React.createElement(CollapsibleSection, _extends({
+    title: "Dados b\xE1sicos dos contratos",
+    defaultOpen: true
+  }, sectionProps), /*#__PURE__*/React.createElement("div", {
+    className: "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mb-3 flex flex-wrap items-center justify-between gap-3"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "text-xs font-bold text-slate-700"
+  }, "Visualizar por ", /*#__PURE__*/React.createElement("select", {
+    value: view,
+    onChange: event => setView(event.target.value),
+    className: "ml-1 rounded border border-slate-300 p-2"
+  }, Object.entries(BasicContract.views).map(_ref63 => {
+    let [key, label] = _ref63;
+    return /*#__PURE__*/React.createElement("option", {
+      key: key,
+      value: key
+    }, label);
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap items-center gap-3"
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-slate-600"
+  }, contracts.length, " contrato(s) \xB7 ", groups.length, " grupo(s)"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !groups.length,
+    onClick: () => setGroupsClosed(groups.map(_ref64 => {
+      let [name] = _ref64;
+      return name;
+    }), allOpen),
+    className: "rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-800 hover:bg-blue-100 disabled:opacity-50"
+  }, allOpen ? 'Recolher tudo' : 'Exibir tudo'))), error && /*#__PURE__*/React.createElement("p", {
+    role: "alert",
+    className: "mb-3 text-sm text-red-700"
+  }, error), !contracts.length ? /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-slate-600"
+  }, "Nenhum contrato da base Geral corresponde aos filtros.") : /*#__PURE__*/React.createElement("div", {
+    className: "max-h-[70vh] overflow-auto",
+    role: "region",
+    "aria-label": "Matriz de dados b\xE1sicos dos contratos",
+    tabIndex: 0
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full min-w-[1500px] border-collapse text-left text-xs"
+  }, /*#__PURE__*/React.createElement("thead", {
+    className: "sticky top-0 z-10 bg-slate-800 text-white"
+  }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    scope: "col",
+    className: "p-2"
+  }, "Ficha"), BasicContract.fields.map(field => /*#__PURE__*/React.createElement("th", {
+    scope: "col",
+    key: field,
+    className: "min-w-[125px] p-2"
+  }, field)))), groups.map(_ref65 => {
+    let [name, rows] = _ref65;
+    return /*#__PURE__*/React.createElement("tbody", {
+      key: name,
+      className: "divide-y divide-slate-100"
+    }, /*#__PURE__*/React.createElement("tr", {
+      className: "bg-blue-50 text-blue-900"
+    }, /*#__PURE__*/React.createElement("th", {
+      scope: "rowgroup",
+      colSpan: BasicContract.fields.length + 1,
+      className: "p-2"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "inline-flex flex-wrap items-center gap-2"
+    }, /*#__PURE__*/React.createElement("span", null, BasicContract.views[view], " \xB7 ", view === 'fornecedor' ? /*#__PURE__*/React.createElement(CounterpartyLink, {
+      name: name,
+      title: "Abrir fornecedor no Portal da Transpar\xEAncia"
+    }) : name, " (", rows.length, ")"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      "aria-expanded": !isClosed(name),
+      "aria-label": `${isClosed(name) ? 'Exibir' : 'Recolher'} grupo ${name}`,
+      onClick: () => setGroupsClosed([name], !isClosed(name)),
+      className: "inline-flex items-center gap-1 rounded border border-blue-200 bg-white px-2 py-1 text-xs text-blue-800 hover:bg-blue-100"
+    }, /*#__PURE__*/React.createElement("span", {
+      "aria-hidden": "true"
+    }, isClosed(name) ? '▸' : '▾'), isClosed(name) ? 'Exibir' : 'Recolher'), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      className: txtButton,
+      "aria-label": `Baixar fichas TXT do grupo ${name}`,
+      onClick: () => {
+        setError('');
+        try {
+          BasicContract.downloadGroup(view, name, rows);
+        } catch {
+          setError('O navegador não conseguiu baixar o TXT deste grupo.');
+        }
+      }
+    }, "TXT"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      className: "rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-100",
+      "aria-label": `Imprimir fichas do grupo ${name}`,
+      onClick: () => setPrintJob({
+        title: BasicContract.groupTitle(view, name, rows.length),
+        rows
+      })
+    }, "Imprimir")))), !isClosed(name) && rows.map(_ref66 => {
+      let {
+        row,
+        data
+      } = _ref66;
+      return /*#__PURE__*/React.createElement("tr", {
+        key: row.contrato,
+        className: "align-top hover:bg-slate-50"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "p-2"
+      }, /*#__PURE__*/React.createElement("button", {
+        type: "button",
+        "aria-label": `Baixar TXT do contrato ${row.contrato}`,
+        onClick: () => exportRow(row, data),
+        className: txtButton
+      }, "TXT")), data.map((value, i) => /*#__PURE__*/React.createElement("td", {
+        key: BasicContract.fields[i],
+        className: "p-2"
+      }, i === 2 ? /*#__PURE__*/React.createElement(CounterpartyLink, {
+        name: value,
+        title: "Abrir fornecedor no Portal da Transpar\xEAncia"
+      }) : value)));
+    }));
+  })))), printJob && ReactDOM.createPortal(/*#__PURE__*/React.createElement("article", {
+    className: "contract-group-print"
+  }, /*#__PURE__*/React.createElement("h1", null, printJob.title), printJob.rows.map(_ref67 => {
+    let {
+      row,
+      data
+    } = _ref67;
+    return /*#__PURE__*/React.createElement("section", {
+      key: row.contrato
+    }, /*#__PURE__*/React.createElement("h2", null, "Contrato ", row.contrato), /*#__PURE__*/React.createElement("pre", null, BasicContract.asText(data)));
+  })), document.body));
+}
 
 // 6. NAVEGAÇÃO E PAINEL — estados de filtro, índices da carga e agregações memorizadas.
 const DashboardPages = Object.freeze([{
@@ -8236,12 +9100,20 @@ const DashboardPages = Object.freeze([{
   id: 5,
   label: 'PÁGINA 5',
   detail: 'Tabelas dos documentos'
+}, {
+  id: 6,
+  label: 'PÁGINA 6',
+  detail: 'Painel de auditorias'
+}, {
+  id: 7,
+  label: 'PÁGINA 7',
+  detail: 'Dados básicos dos contratos'
 }]);
-function PageNavigation(_ref53) {
+function PageNavigation(_ref68) {
   let {
     activePage,
     onPageChange
-  } = _ref53;
+  } = _ref68;
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef(null),
     panelRef = useRef(null);
@@ -8362,19 +9234,29 @@ function Dashboard() {
   const [rawData, setRawData] = useState([]);
   const [apiPayload, setApiPayload] = useState(null);
   const [linkDiagnostics, setLinkDiagnostics] = useState(null);
+  const [logWarning, setLogWarning] = useState(() => sessionStorage.getItem('log_warning_TotalV7') || '');
   const missingFileColumns = useMemo(() => ContractFiles.missingColumns(apiPayload === null || apiPayload === void 0 ? void 0 : apiPayload.geral), [apiPayload]);
   const [resetRevision, setResetRevision] = useState(0);
   const loadingRef = useRef(false);
-  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV6') === '1');
+  const [summaryRequested, setSummaryRequested] = useState(() => sessionStorage.getItem('summary_pending_TotalV7') === '1');
   const closeSummary = React.useCallback(() => {
-    sessionStorage.removeItem('summary_pending_TotalV6');
+    sessionStorage.removeItem('summary_pending_TotalV7');
     setSummaryRequested(false);
   }, []);
   const [activePage, setActivePage] = useState(1);
+  const [closedFilters, setClosedFilters] = useState({});
+  const filterGroup = title => ({
+    title,
+    open: !closedFilters[title],
+    onToggle: () => setClosedFilters(previous => ({
+      ...previous,
+      [title]: !previous[title]
+    }))
+  });
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("A verificar sessão local...");
-  const currentUser = sessionStorage.getItem('user_TotalV6') || 'Usuário';
-  const currentPerfil = sessionStorage.getItem('perfil_TotalV6') || '';
+  const currentUser = sessionStorage.getItem('user_TotalV7') || 'Usuário';
+  const currentPerfil = sessionStorage.getItem('perfil_TotalV7') || '';
 
   // Estado de Expansão Global das seções
   const [globalExpandState, setGlobalExpandState] = useState(false);
@@ -8795,11 +9677,12 @@ function Dashboard() {
     if (isNonCSupActive) setFSecLog([]);else setFSecLog(nonCSupItems);
   };
   const showCOLOG = () => setFSecLog([]);
-  const logout = () => {
+  const logout = async () => {
+    await AccessLog.logout();
     clearAuthStorage();
     try {
       localStorage.removeItem(DASH_CACHE_KEY);
-      localStorage.removeItem('dashData_TotalV6');
+      localStorage.removeItem('dashData_TotalV7');
     } catch (e) {}
     window.location.reload();
   };
@@ -9051,12 +9934,14 @@ function Dashboard() {
     let contabilRows = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
     let orcamentarioRows = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [];
     let fromCache = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : false;
+    let registeredNames = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : {};
     if (!rowsArray || rowsArray.length < 1) {
       setStatus("Planilha vazia ou aba não encontrada.");
       setLoading(false);
       return;
     }
     const ledgerIndex = ContractRules.accountingBalances(contabilRows);
+    const fullSupplier = supplierNameResolver(rowsArray, orcamentarioRows, contabilRows, registeredNames);
     setApiPayload({
       geral: rowsArray,
       contabil: contabilRows,
@@ -9068,8 +9953,8 @@ function Dashboard() {
     const filesByContract = ContractFiles.index(rowsArray);
     const normalizedHeaders = headers.map(normalizeStr);
     const headerIndices = new Map(normalizedHeaders.map((value, index) => [value, index]));
-    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref54 => {
-      let [contract, totals] = _ref54;
+    const recebidoByContrato = Object.fromEntries([...ledgerIndex].map(_ref69 => {
+      let [contract, totals] = _ref69;
       return [contract, totals.v_recebido];
     }));
     const receivedAssigned = new Set();
@@ -9129,8 +10014,9 @@ function Dashboard() {
         ao_codigos: orcamentario.ao_codigo_values.join('; ') || '-',
         po_codigos: orcamentario.po_codigo_values.join('; ') || '-',
         nd_codigos: orcamentario.nd_codigo_values.join('; ') || '-',
-        fornecedor: (getVal(["Fornecedor"]) || "N/I").toUpperCase(),
+        fornecedor: fullSupplier(getVal(["Fornecedor"])),
         objeto: (getVal(["Objeto"]) || "-").toUpperCase(),
+        processo: getVal(["Processo", "Número do Processo", "Nr Processo de Seleção"]),
         fiscal: (getVal(["FISCAL_TITULAR", "Fiscal Titular"]) || "N/I").toUpperCase(),
         gestor: (getVal(["GESTOR_TITULAR", "Gestor Titular"]) || "N/I").toUpperCase(),
         fiscal_sub: (getVal(["FISCAL_SUBSTITUTO", "Fiscal Substituto"]) || "N/I").toUpperCase(),
@@ -9168,9 +10054,9 @@ function Dashboard() {
       };
     }).filter(r => r.contrato !== "-");
     const canonicalIndex = ContractRules.contractIndex(mappedRaw);
-    const canonicalClassifications = new Map([...canonicalIndex].map(_ref55 => {
+    const canonicalClassifications = new Map([...canonicalIndex].map(_ref70 => {
       var _ledgerIndex$get;
-      let [id, entry] = _ref55;
+      let [id, entry] = _ref70;
       return [id, ContractRules.classify(entry.totals, entry.metadata, (_ledgerIndex$get = ledgerIndex.get(id)) === null || _ledgerIndex$get === void 0 ? void 0 : _ledgerIndex$get.hasMovement, hoje)];
     }));
 
@@ -9216,11 +10102,19 @@ function Dashboard() {
       return;
     }
     try {
+      var _json$logAcesso3;
       setStatus("A transferir dados via Api...");
-      const token = sessionStorage.getItem('token_TotalV6');
+      const token = sessionStorage.getItem('token_TotalV7');
       if (!token) throw new Error("Token de acesso não encontrado. Faça login novamente.");
-      const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}`);
+      const event = AccessLog.dataEvent(forceSync);
+      const eventQuery = event.evento ? '&' + new URLSearchParams(event).toString() : '';
+      const response = await fetch(`${APPS_SCRIPT_URL}?acao=dados&token=${encodeURIComponent(token)}${eventQuery}`);
       const json = await readAppsScriptJson(response, 'a sincronização dos dados');
+      setLogWarning(current => {
+        var _json$recursos, _json$logAcesso, _json$logAcesso2;
+        return ((_json$recursos = json.recursos) === null || _json$recursos === void 0 ? void 0 : _json$recursos.log_acesso) !== true ? 'O registro de acessos ainda não está disponível nesta API. Atualize a implantação para ativá-lo.' : ((_json$logAcesso = json.logAcesso) === null || _json$logAcesso === void 0 ? void 0 : _json$logAcesso.ok) === false ? json.logAcesso.mensagem : ((_json$logAcesso2 = json.logAcesso) === null || _json$logAcesso2 === void 0 ? void 0 : _json$logAcesso2.ok) === true ? '' : current;
+      });
+      if (((_json$logAcesso3 = json.logAcesso) === null || _json$logAcesso3 === void 0 ? void 0 : _json$logAcesso3.ok) === true) sessionStorage.removeItem('log_warning_TotalV7');
       if (!json.ok) {
         const mensagem = json.mensagem || "Falha ao obter dados pelo Apps Script.";
         if (/sess[aã]o|expirad|token/i.test(mensagem)) {
@@ -9235,7 +10129,7 @@ function Dashboard() {
       }
       const rows = json.geral || json.values;
       if (!rows || rows.length < 1) throw new Error("Apps Script não retornou dados da planilha geral.");
-      processData(rows, json.contabil || [], json.orcamentario || [], false);
+      processData(rows, json.contabil || [], json.orcamentario || [], false, json.nomesFornecedores);
       setLinkDiagnostics(json.diagnosticoOrcamentario || null);
       const controle = json.controleAcesso || {};
       setStatus(`Online - Dados carregados via Api | ${ContractRules.accessText(controle)}`);
@@ -9248,7 +10142,9 @@ function Dashboard() {
     }
   };
   useEffect(() => {
+    const detachLog = AccessLog.start();
     loadData(false, null);
+    return detachLog;
   }, []);
   const filterOptions = useMemo(() => {
     const scalarFields = ['fiscal', 'gestor', 'fiscal_sub', 'gestor_sub', 'sec_log', 'contrato', 'compra', 'modalidade', 'fornecedor'];
@@ -9293,8 +10189,8 @@ function Dashboard() {
       nd_subelemento_filter_values: 'nd_subelemento_filter_values'
     };
     documentDashboard.budgetIndex.byContract.forEach(details => details.forEach(detail => {
-      Object.entries(budgetOptionsMap).forEach(_ref56 => {
-        let [field, property] = _ref56;
+      Object.entries(budgetOptionsMap).forEach(_ref71 => {
+        let [field, property] = _ref71;
         const values = Array.isArray(detail[property]) ? detail[property] : splitBudgetDimensionValue(detail[property]);
         values.forEach(value => {
           if (value && value !== '-' && value !== 'N/I') accumulators[field].add(value);
@@ -9753,62 +10649,12 @@ function Dashboard() {
     });
     return Object.values(map);
   };
-  const getOrcamentarioPieData = dimensionKey => {
-    const map = {};
-    filteredOrcamentarioDetails.forEach(detail => {
-      const rawLabel = detail[dimensionKey] && detail[dimensionKey] !== '-' ? detail[dimensionKey] : 'N/I';
-      const labels = dimensionKey === 'nd_codigo' ? splitBudgetDimensionValue(rawLabel) : [rawLabel];
-      const nameKey = dimensionKey.replace('_codigo', '_nome');
-      const rawName = detail[nameKey] && detail[nameKey] !== '-' ? detail[nameKey] : 'N/I';
-      const names = dimensionKey === 'nd_codigo' ? splitBudgetDimensionValue(rawName) : [rawName];
-      const normalizedLabels = labels.length ? labels : ['N/I'];
-      const allocation = 1 / normalizedLabels.length;
-      normalizedLabels.forEach((label, index) => {
-        const dimensionName = names[index] || (names.length === 1 ? names[0] : 'N/I');
-        if (!map[label]) map[label] = {
-          label,
-          contracts: new Set(),
-          descriptions: new Set(),
-          total: 0,
-          recebido: 0,
-          a_receber: 0,
-          liquidado: 0,
-          a_liquidar: 0,
-          pago: 0,
-          a_pagar: 0,
-          bloqueado: 0,
-          cancelado: 0,
-          executado: 0
-        };
-        const target = map[label];
-        target.contracts.add(UnifiedData.key(detail.contrato));
-        target.descriptions.add(`${label} – ${dimensionName}`);
-        target.total += (detail.v_empenhado || 0) * allocation;
-        target.recebido += (detail.v_recebido || 0) * allocation;
-        target.a_receber += ((detail.v_empenhado || 0) - (detail.v_recebido || 0)) * allocation;
-        target.liquidado += (detail.v_liquidado || 0) * allocation;
-        target.a_liquidar += (detail.v_a_liquidar || 0) * allocation;
-        target.pago += (detail.v_pago || 0) * allocation;
-        target.a_pagar += (detail.v_a_pagar || 0) * allocation;
-        target.bloqueado += (detail.v_bloqueado || 0) * allocation;
-        target.cancelado += (detail.v_cancelado || 0) * allocation;
-        target.executado += (detail.v_executado || 0) * allocation;
-      });
-    });
-    return Object.values(map).map(item => ({
-      ...item,
-      count: item.contracts.size,
-      tooltip: Array.from(item.descriptions).join('\n')
-    }));
-  };
   const modData = getPieDataFull('modalidade');
   const secData = getPieDataFull('sec_log');
   const compraData = getPieDataFull('compra');
   const fornData = getPieDataFull('fornecedor');
   const anoVigIniData = getPieDataFull('ano_vig_ini');
-  const aoCodigoData = getOrcamentarioPieData('ao_codigo');
-  const ndCodigoData = getOrcamentarioPieData('nd_codigo');
-
+  const budgetCharts = useMemo(() => activePage === 1 ? budgetChartGroups(filteredOrcamentarioDetails) : {}, [activePage, filteredOrcamentarioDetails]);
   // Gráficos Situação restritos a apenas as 7 TAGS
   const allowedSitTags = ['VIG SEM EXEC', 'VIG EM EXEC', 'VIG EXEC TOTAL', 'VIG EXEC PARCIAL', 'VENC INEXEC TOTAL', 'VENC EXEC TOTAL', 'VENC EXEC PARCIAL'];
   const sitFilter = item => item.situacaoFlags.some(f => allowedSitTags.includes(f.label));
@@ -10000,6 +10846,13 @@ function Dashboard() {
 
   // Performance and correlation share one immutable aggregate per filtered set.
   const canonicalChartRows = useMemo(() => ContractRules.aggregateContracts(filteredData), [filteredData]);
+  const isReportPage = activePage === 6 || activePage === 7;
+  const reportNotes = useMemo(() => isReportPage ? BasicContract.commitments(apiPayload === null || apiPayload === void 0 ? void 0 : apiPayload.orcamentario, documentDashboard.rawRows) : null, [isReportPage, apiPayload === null || apiPayload === void 0 ? void 0 : apiPayload.orcamentario, documentDashboard.rawRows]);
+  const reportContracts = useMemo(() => {
+    if (!isReportPage) return [];
+    const selected = new Set(filteredData.map(row => UnifiedData.key(row.contrato)));
+    return ContractRules.aggregateContracts(rawData.filter(row => selected.has(UnifiedData.key(row.contrato))));
+  }, [isReportPage, filteredData, rawData]);
   const contratoAllData = useMemo(() => {
     const remaining = row => row.encerrando_dias === null || !Number.isFinite(row.encerrando_dias) ? null : row.encerrando_dias;
     const arr = canonicalChartRows.map(row => ({
@@ -10766,20 +11619,23 @@ function Dashboard() {
   }, linkDiagnostics.colunasAusentes ? "Classificação orçamentária indisponível: conferir cabeçalhos das fontes." : `${linkDiagnostics.ambiguos} registro(s) orçamentário(s) com vínculo ambíguo. Confira contrato e emitente na origem.`), missingFileColumns.length > 0 && /*#__PURE__*/React.createElement("p", {
     role: "status",
     className: "text-xs text-amber-700 mt-2"
-  }, "A fonte de dados n\xE3o enviou todas as colunas de ARQUIVOS. Atualize a API e clique em SINCRONIZAR APIs para carregar os links."), metadataConflictCount > 0 && /*#__PURE__*/React.createElement("p", {
+  }, "A fonte de dados n\xE3o enviou todas as colunas de ARQUIVOS. Atualize a API e clique em SINCRONIZAR APIs para carregar os links."), logWarning && /*#__PURE__*/React.createElement("p", {
+    role: "status",
+    className: "text-xs text-amber-700 mt-2"
+  }, logWarning), metadataConflictCount > 0 && /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-amber-700 mt-2"
   }, metadataConflictCount, " contrato(s) com metadados divergentes na base geral. Vig\xEAncia e classifica\xE7\xE3o usam o primeiro registro; os saldos das linhas distintas foram somados.")), /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-wrap gap-3 items-center bg-white px-5 py-3 rounded-xl border border-slate-200 shadow-sm max-w-full"
+    className: "grid max-w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 rounded-xl border border-slate-200 bg-white px-5 py-3 shadow-sm lg:flex"
   }, /*#__PURE__*/React.createElement(AccessMetadata, null), /*#__PURE__*/React.createElement("div", {
-    className: "w-[1px] h-8 bg-slate-300 mx-1 hidden md:block shrink-0"
+    className: "mx-1 hidden h-8 w-px shrink-0 bg-slate-300 lg:block"
   }), /*#__PURE__*/React.createElement("span", {
-    className: "text-[11px] font-black text-slate-500 uppercase whitespace-nowrap ml-1 shrink-0"
+    className: "col-start-1 row-start-2 min-w-0 text-[11px] font-black uppercase text-slate-500"
   }, "LOGADO COMO: ", /*#__PURE__*/React.createElement("span", {
     className: "text-blue-600"
   }, String(currentUser || 'Usuário').toUpperCase()), currentPerfil && /*#__PURE__*/React.createElement("span", {
     className: "text-slate-400"
   }, " (", String(currentPerfil).toUpperCase(), ")")), /*#__PURE__*/React.createElement("div", {
-    className: "flex max-w-full flex-wrap items-center gap-2",
+    className: "col-start-2 row-span-2 row-start-1 ml-auto flex flex-col items-stretch gap-2",
     "aria-label": "A\xE7\xF5es da sess\xE3o"
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
@@ -10801,9 +11657,7 @@ function Dashboard() {
     className: "max-w-[1600px] mx-auto mb-6 bg-white p-5 rounded-2xl shadow-sm border border-slate-200"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mb-4 pb-4 border-b border-slate-100 flex flex-col gap-3"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "filter-subtitle"
-  }, "A\xE7\xF5es r\xE1pidas de contratos"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(FilterGroup, filterGroup('Ações rápidas de contratos'), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
   }, /*#__PURE__*/React.createElement("button", {
     title: QuickActionHelp.current(todayStr),
@@ -10853,8 +11707,8 @@ function Dashboard() {
     className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isVencidos30Active ? 'bg-red-700 text-white border-red-700 ring-2 ring-red-400 ring-offset-1' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`
   }, "CONTR VENCIDOS H\xC1 30 DIAS")), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-2 items-center"
-  }, Object.entries(tagColorsMap).map(_ref57 => {
-    let [label, config] = _ref57;
+  }, Object.entries(tagColorsMap).map(_ref72 => {
+    let [label, config] = _ref72;
     const isActive = fSituacaoTags.includes(label);
     return /*#__PURE__*/React.createElement("button", {
       key: label,
@@ -10862,9 +11716,7 @@ function Dashboard() {
       onClick: () => toggleSituacaoTag(label),
       className: `text-[9px] font-bold uppercase px-3 py-1.5 rounded transition shadow-sm border ${isActive ? config.css + ' border-transparent shadow-inner ring-2 ring-blue-400 ring-offset-1' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`
     }, label);
-  })), documentDashboard.actions), /*#__PURE__*/React.createElement("h3", {
-    className: "filter-subtitle"
-  }, "Contratos"), /*#__PURE__*/React.createElement("div", {
+  })), documentDashboard.contractActions), /*#__PURE__*/React.createElement(FilterGroup, filterGroup('Documentos e movimentos'), documentDashboard.actions)), /*#__PURE__*/React.createElement(FilterGroup, filterGroup('Contratos'), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-4"
   }, /*#__PURE__*/React.createElement(MultiSelect, {
     label: "FISCAL",
@@ -10929,9 +11781,7 @@ function Dashboard() {
     label: "VIG\xCANCIA FIM (AT\xC9)",
     value: dFimAte,
     onChange: setDFimAte
-  })), documentDashboard.filters, /*#__PURE__*/React.createElement("h3", {
-    className: "filter-subtitle"
-  }, "Or\xE7amento"), /*#__PURE__*/React.createElement("div", {
+  }))), /*#__PURE__*/React.createElement(FilterGroup, filterGroup('Documentos'), documentDashboard.filters), /*#__PURE__*/React.createElement(FilterGroup, filterGroup('Orçamento'), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4"
   }, /*#__PURE__*/React.createElement(MultiSelect, {
     label: "AO C\xD3DIGO \u2013 NOME",
@@ -10973,7 +11823,7 @@ function Dashboard() {
     options: filterOptions.nd_subelemento_filter_values,
     selected: fSubelemento,
     onChange: setFSubelemento
-  })))), /*#__PURE__*/React.createElement("div", {
+  }))))), /*#__PURE__*/React.createElement("div", {
     className: "max-w-[1600px] mx-auto flex justify-end mb-3"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: toggleAllSections,
@@ -10985,9 +11835,7 @@ function Dashboard() {
     globalState: globalExpandState
   }, /*#__PURE__*/React.createElement("h3", {
     className: "filter-subtitle max-w-[1600px] mx-auto"
-  }, "Contratos"), /*#__PURE__*/React.createElement("p", {
-    className: "max-w-[1600px] mx-auto mb-3 text-xs text-slate-500"
-  }, "As situa\xE7\xF5es de execu\xE7\xE3o s\xE3o exclusivas. CAN e BLOQ s\xE3o tags adicionais. As quantidades de vigentes e vencidos contam cada contrato uma \xFAnica vez."), /*#__PURE__*/React.createElement("div", {
+  }, "Contratos"), /*#__PURE__*/React.createElement("div", {
     className: "max-w-[1600px] mx-auto grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 gap-4 mb-4"
   }, /*#__PURE__*/React.createElement(KPICard, {
     title: "QTD Contratos",
@@ -11540,35 +12388,25 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     isFinancial: false
   }))), /*#__PURE__*/React.createElement("div", {
     className: "max-w-[1600px] mx-auto grid grid-cols-1 xl:grid-cols-2 gap-6 mb-10"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-1 md:grid-cols-2 gap-6"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "md:col-span-2 text-center text-sm font-black text-slate-700 uppercase tracking-widest"
-  }, "AO C\xF3digo"), /*#__PURE__*/React.createElement(ToggleableChartCard, {
-    id: "pAoCodigoV",
-    title: "Empenhado (AO C\xF3digo)",
-    data: aoCodigoData,
-    isFinancial: true
-  }), /*#__PURE__*/React.createElement(ToggleableChartCard, {
-    id: "pAoCodigoQ",
-    title: "QTD Contratos (AO C\xF3digo)",
-    data: aoCodigoData,
-    isFinancial: false
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-1 md:grid-cols-2 gap-6"
-  }, /*#__PURE__*/React.createElement("h3", {
-    className: "md:col-span-2 text-center text-sm font-black text-slate-700 uppercase tracking-widest"
-  }, "ND C\xF3digo"), /*#__PURE__*/React.createElement(ToggleableChartCard, {
-    id: "pNdCodigoV",
-    title: "Empenhado (ND C\xF3digo)",
-    data: ndCodigoData,
-    isFinancial: true
-  }), /*#__PURE__*/React.createElement(ToggleableChartCard, {
-    id: "pNdCodigoQ",
-    title: "QTD Contratos (ND C\xF3digo)",
-    data: ndCodigoData,
-    isFinancial: false
-  })))), activePage === 2 && /*#__PURE__*/React.createElement(CollapsibleSection, {
+  }, [['AoCodigo', 'AO Código', budgetCharts.ao], ['AoPoCodigo', 'AO-PO Código', budgetCharts.aoPo], ['GrupoCodigo', 'Grupo Código', budgetCharts.grupo], ['NdCodigo', 'ND Código', budgetCharts.nd]].map(_ref73 => {
+    let [id, label, data] = _ref73;
+    return /*#__PURE__*/React.createElement("div", {
+      key: id,
+      className: "grid grid-cols-1 md:grid-cols-2 gap-6"
+    }, /*#__PURE__*/React.createElement("h3", {
+      className: "md:col-span-2 text-center text-sm font-black text-slate-700 uppercase tracking-widest"
+    }, label), /*#__PURE__*/React.createElement(ToggleableChartCard, {
+      id: `p${id}V`,
+      title: `Empenhado (${label})`,
+      data: data,
+      isFinancial: true
+    }), /*#__PURE__*/React.createElement(ToggleableChartCard, {
+      id: `p${id}Q`,
+      title: `QTD Contratos (${label})`,
+      data: data,
+      isFinancial: false
+    }));
+  }))), activePage === 2 && /*#__PURE__*/React.createElement(CollapsibleSection, {
     title: "GR\xC1FICOS DE EXECU\xC7\xC3O",
     defaultOpen: false,
     globalTrigger: expandTrigger,
@@ -11626,7 +12464,7 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     exportRows: top20TableRows.slice(0, 20),
     exportColumns: top20TableColumns,
     data: {
-      labels: top20DataProcessed.map(d => formatLabelMultiLine(top20ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label)),
+      labels: top20DataProcessed.map(d => formatLabelMultiLine(top20ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label, 18, top20ViewMode === 'fornecedor')),
       datasets: [{
         label: 'QTD Contratos',
         data: top20DataProcessed.map(d => d.count),
@@ -11959,7 +12797,7 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     exportRows: top20100TableRows.slice(0, 20),
     exportColumns: top20100TableColumns,
     data: {
-      labels: top20100DataProcessed.map(d => formatLabelMultiLine(top20100ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label)),
+      labels: top20100DataProcessed.map(d => formatLabelMultiLine(top20100ViewMode === 'fornecedor' ? d.label.replace(/^[\d\.\-\/]+\s*-\s*/, '') : d.label, 18, top20100ViewMode === 'fornecedor')),
       datasets: [{
         label: 'QTD Contratos',
         data: top20100DataProcessed.map(d => d.count),
@@ -13352,7 +14190,22 @@ Substituto: ${kpis.qtdFiscaisSub}`,
     style: MetricColors.textStyle('pago')
   }, formatBRL(totalsMaster.pag)), masterVisibleCols.pExecLiq && /*#__PURE__*/React.createElement("td", {
     className: "p-3 text-center"
-  }, "-"))))))), documentDashboard.page4, documentDashboard.page5);
+  }, "-"))))))), documentDashboard.page4, documentDashboard.page5, activePage === 6 && /*#__PURE__*/React.createElement(AuditPage, {
+    contracts: reportContracts,
+    missingColumns: missingFileColumns,
+    notes: reportNotes,
+    sectionProps: {
+      globalTrigger: expandTrigger,
+      globalState: globalExpandState
+    }
+  }), activePage === 7 && /*#__PURE__*/React.createElement(BasicPage, {
+    contracts: reportContracts,
+    notes: reportNotes,
+    sectionProps: {
+      globalTrigger: expandTrigger,
+      globalState: globalExpandState
+    }
+  }));
 }
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -13379,7 +14232,7 @@ class ErrorBoundary extends React.Component {
       onClick: () => {
         clearAuthStorage();
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV6');
+        localStorage.removeItem('dashData_TotalV7');
         window.location.reload();
       },
       className: "bg-red-600 text-white px-6 py-3 rounded shadow font-bold hover:bg-red-700"
@@ -13400,11 +14253,12 @@ function App() {
     setError("");
     setIsLogging(true);
     try {
-      var _json$usuario, _json$usuario2, _json$usuario3, _json$usuario4, _json$usuario5, _json$usuario6;
+      var _json$logAcesso4, _json$usuario, _json$usuario2, _json$usuario3, _json$usuario4, _json$usuario5, _json$usuario6;
       const body = new URLSearchParams();
       body.append("acao", "login");
       body.append("usuario", username);
       body.append("senha", password);
+      body.append("evento_id", "login_" + AccessLog.id());
       const resp = await fetch(APPS_SCRIPT_URL, {
         method: "POST",
         body
@@ -13415,17 +14269,19 @@ function App() {
         setIsLogging(false);
         return;
       }
-      sessionStorage.setItem('token_TotalV6', json.token);
-      sessionStorage.setItem('summary_pending_TotalV6', '1');
-      sessionStorage.setItem('user_TotalV6', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
-      sessionStorage.setItem('perfil_TotalV6', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
-      sessionStorage.setItem('ativo_TotalV6', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
-      sessionStorage.setItem('validade_TotalV6', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
-      sessionStorage.setItem('duracao_diaria_horas_TotalV6', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
-      sessionStorage.setItem('expira_TotalV6', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
+      AccessLog.afterLogin();
+      sessionStorage.setItem('log_warning_TotalV7', ((_json$logAcesso4 = json.logAcesso) === null || _json$logAcesso4 === void 0 ? void 0 : _json$logAcesso4.ok) === false ? json.logAcesso.mensagem : '');
+      sessionStorage.setItem('token_TotalV7', json.token);
+      sessionStorage.setItem('summary_pending_TotalV7', '1');
+      sessionStorage.setItem('user_TotalV7', ((_json$usuario = json.usuario) === null || _json$usuario === void 0 ? void 0 : _json$usuario.nome) || username);
+      sessionStorage.setItem('perfil_TotalV7', ((_json$usuario2 = json.usuario) === null || _json$usuario2 === void 0 ? void 0 : _json$usuario2.perfil) || '');
+      sessionStorage.setItem('ativo_TotalV7', ((_json$usuario3 = json.usuario) === null || _json$usuario3 === void 0 ? void 0 : _json$usuario3.ativo) || '');
+      sessionStorage.setItem('validade_TotalV7', ((_json$usuario4 = json.usuario) === null || _json$usuario4 === void 0 ? void 0 : _json$usuario4.validade) || '');
+      sessionStorage.setItem('duracao_diaria_horas_TotalV7', ((_json$usuario5 = json.usuario) === null || _json$usuario5 === void 0 ? void 0 : _json$usuario5.duracao_diaria_horas) || '');
+      sessionStorage.setItem('expira_TotalV7', ((_json$usuario6 = json.usuario) === null || _json$usuario6 === void 0 ? void 0 : _json$usuario6.expira_em) || '');
       try {
         localStorage.removeItem(DASH_CACHE_KEY);
-        localStorage.removeItem('dashData_TotalV6');
+        localStorage.removeItem('dashData_TotalV7');
       } catch (e) {}
       setIsAuthenticated(true);
       setIsLogging(false);
